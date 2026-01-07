@@ -1,5 +1,5 @@
 name: 'Blacksmith Cache Checkout'
-description: 'Checkout a Git repository using Blacksmith sticky disk for caching. Falls back to standard checkout on non-Blacksmith runners.'
+description: 'Checkout a Git repository using Blacksmith sticky disk for caching. Falls back to standard checkout on non-Blacksmith runners or cache failures.'
 
 inputs:
   cache-key:
@@ -75,7 +75,7 @@ outputs:
     value: ${{ steps.checkout.outputs.commit }}
   cache-hit:
     description: 'Whether the sticky disk cache was hit'
-    value: ${{ steps.warmup.outputs.cache-hit }}
+    value: ${{ steps.warmup.outputs.cache-hit || 'false' }}
 
 runs:
   using: 'composite'
@@ -100,21 +100,23 @@ runs:
         fi
 
     - name: Mount sticky disk for .git
+      id: stickydisk
       if: steps.detect.outputs.is-blacksmith == 'true'
+      continue-on-error: true
       uses: useblacksmith/stickydisk@v1
       with:
         key: ${{ inputs.cache-key || format('{0}-git', github.repository) }}
         path: ${{ inputs.path && format('{0}/{1}', github.workspace, inputs.path) || github.workspace }}/.git
 
     - name: Warm up cache if empty
-      if: steps.detect.outputs.is-blacksmith == 'true'
       id: warmup
+      if: steps.detect.outputs.is-blacksmith == 'true' && steps.stickydisk.outcome == 'success'
+      continue-on-error: true
       shell: bash
       env:
         GITHUB_TOKEN: ${{ inputs.token }}
         REPO: ${{ inputs.repository }}
         SERVER_URL: ${{ inputs.github-server-url || 'https://github.com' }}
-        FETCH_DEPTH: ${{ inputs.fetch-depth }}
         WORKSPACE: ${{ inputs.path && format('{0}/{1}', github.workspace, inputs.path) || github.workspace }}
         SSH_KEY: ${{ inputs.ssh-key }}
       run: |
@@ -134,12 +136,8 @@ runs:
           git remote add origin "$EXPECTED_URL"
           # Use token via credential helper for fetch
           git config --local http.${SERVER_URL}/.extraheader "AUTHORIZATION: basic $(echo -n x-access-token:${GITHUB_TOKEN} | base64)"
-          # Fetch with specified depth (0 means full history)
-          if [ "$FETCH_DEPTH" = "0" ]; then
-            git fetch origin
-          else
-            git fetch origin --depth=$FETCH_DEPTH
-          fi
+          # Fetch entire repo for cache warmup (checkout will handle depth)
+          git fetch origin
           # Set HEAD without checking out files (checkout action will handle working tree)
           git symbolic-ref HEAD refs/heads/__temp_branch
           git update-ref refs/heads/__temp_branch FETCH_HEAD
@@ -166,6 +164,14 @@ runs:
         # won't remove tracked files that sparse-checkout disable restored)
         echo "Cleaning working tree..."
         find . -mindepth 1 -maxdepth 1 ! -name '.git' -exec rm -rf {} +
+
+    - name: Clean up on cache failure
+      if: steps.detect.outputs.is-blacksmith == 'true' && (steps.stickydisk.outcome == 'failure' || steps.warmup.outcome == 'failure')
+      shell: bash
+      run: |
+        echo "⚠ Cache operation failed - cleaning up for fresh checkout"
+        WORKSPACE="${{ inputs.path && format('{0}/{1}', github.workspace, inputs.path) || github.workspace }}"
+        rm -rf "$WORKSPACE/.git"
 
     - name: Checkout
       id: checkout
