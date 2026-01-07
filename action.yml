@@ -1,0 +1,176 @@
+name: 'Blacksmith Cache Checkout'
+description: 'Checkout a Git repository using Blacksmith sticky disk for caching'
+
+inputs:
+  cache-key:
+    description: 'Key for the sticky disk cache'
+    required: false
+  repository:
+    description: 'Repository name with owner'
+    default: ${{ github.repository }}
+  ref:
+    description: 'The branch, tag or SHA to checkout'
+    required: false
+  token:
+    description: 'Personal access token'
+    default: ${{ github.token }}
+  ssh-key:
+    description: 'SSH key for fetching'
+    required: false
+  ssh-known-hosts:
+    description: 'Known hosts for SSH'
+    required: false
+  ssh-strict:
+    description: 'Strict host key checking'
+    default: 'true'
+  ssh-user:
+    description: 'SSH user'
+    default: 'git'
+  persist-credentials:
+    description: 'Persist credentials'
+    default: 'true'
+  path:
+    description: 'Relative path to checkout'
+    required: false
+  clean:
+    description: 'Clean before fetch (default false for cache efficiency)'
+    default: 'false'
+  filter:
+    description: 'Partial clone filter'
+    required: false
+  sparse-checkout:
+    description: 'Sparse checkout patterns'
+    required: false
+  sparse-checkout-cone-mode:
+    description: 'Cone mode for sparse checkout'
+    default: 'true'
+  fetch-depth:
+    description: 'Number of commits to fetch'
+    default: '1'
+  fetch-tags:
+    description: 'Fetch tags'
+    default: 'false'
+  show-progress:
+    description: 'Show progress'
+    default: 'true'
+  lfs:
+    description: 'Download Git-LFS files'
+    default: 'false'
+  submodules:
+    description: 'Checkout submodules'
+    default: 'false'
+  set-safe-directory:
+    description: 'Set safe directory'
+    default: 'true'
+  github-server-url:
+    description: 'GitHub server URL'
+    required: false
+
+outputs:
+  ref:
+    description: 'The branch, tag or SHA that was checked out'
+    value: ${{ steps.checkout.outputs.ref }}
+  commit:
+    description: 'The commit SHA that was checked out'
+    value: ${{ steps.checkout.outputs.commit }}
+  cache-hit:
+    description: 'Whether the sticky disk cache was hit'
+    value: ${{ steps.warmup.outputs.cache-hit }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Create .git directory
+      shell: bash
+      run: mkdir -p ${{ inputs.path && format('{0}/{1}', github.workspace, inputs.path) || github.workspace }}/.git
+
+    - name: Mount sticky disk for .git
+      uses: useblacksmith/stickydisk@v1
+      with:
+        key: ${{ inputs.cache-key || format('{0}-git', github.repository) }}
+        path: ${{ inputs.path && format('{0}/{1}', github.workspace, inputs.path) || github.workspace }}/.git
+
+    - name: Warm up cache if empty
+      id: warmup
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.token }}
+        REPO: ${{ inputs.repository }}
+        SERVER_URL: ${{ inputs.github-server-url || 'https://github.com' }}
+        FETCH_DEPTH: ${{ inputs.fetch-depth }}
+        WORKSPACE: ${{ inputs.path && format('{0}/{1}', github.workspace, inputs.path) || github.workspace }}
+        SSH_KEY: ${{ inputs.ssh-key }}
+      run: |
+        cd "$WORKSPACE"
+
+        # Determine expected URL format (SSH when ssh-key provided, HTTPS otherwise)
+        if [ -n "$SSH_KEY" ]; then
+          EXPECTED_URL="git@github.com:${REPO}.git"
+        else
+          EXPECTED_URL="${SERVER_URL}/${REPO}"
+        fi
+
+        if [ ! -d ".git/objects" ]; then
+          echo "cache-hit=false" >> $GITHUB_OUTPUT
+          echo "Cache empty - warming up"
+          git init
+          git remote add origin "$EXPECTED_URL"
+          # Use token via credential helper for fetch
+          git config --local http.${SERVER_URL}/.extraheader "AUTHORIZATION: basic $(echo -n x-access-token:${GITHUB_TOKEN} | base64)"
+          # Fetch with specified depth (0 means full history)
+          if [ "$FETCH_DEPTH" = "0" ]; then
+            git fetch origin
+          else
+            git fetch origin --depth=$FETCH_DEPTH
+          fi
+          # Set HEAD without checking out files (checkout action will handle working tree)
+          git symbolic-ref HEAD refs/heads/__temp_branch
+          git update-ref refs/heads/__temp_branch FETCH_HEAD
+        else
+          echo "cache-hit=true" >> $GITHUB_OUTPUT
+          echo "Cache hit"
+          # Update remote URL if it doesn't match expected format
+          CURRENT_URL=$(git remote get-url origin 2>/dev/null || echo "")
+          if [ "$CURRENT_URL" != "$EXPECTED_URL" ]; then
+            echo "Updating remote URL from $CURRENT_URL to $EXPECTED_URL"
+            git remote set-url origin "$EXPECTED_URL"
+          fi
+        fi
+
+        # Clear index to bypass git's cone mode directory check.
+        # Git sparse-checkout in cone mode verifies patterns are directories by
+        # checking the index. Clearing it allows file patterns like flake.lock
+        # to work without "is not a directory" errors.
+        echo "Clearing index..."
+        rm -f .git/index
+
+        # Clean working tree - remove all files except .git
+        # (since we use clean:false to skip checkout's reset, and git clean
+        # won't remove tracked files that sparse-checkout disable restored)
+        echo "Cleaning working tree..."
+        find . -mindepth 1 -maxdepth 1 ! -name '.git' -exec rm -rf {} +
+
+    - name: Checkout
+      id: checkout
+      uses: actions/checkout@v4
+      with:
+        repository: ${{ inputs.repository }}
+        ref: ${{ inputs.ref }}
+        token: ${{ inputs.token }}
+        ssh-key: ${{ inputs.ssh-key }}
+        ssh-known-hosts: ${{ inputs.ssh-known-hosts }}
+        ssh-strict: ${{ inputs.ssh-strict }}
+        ssh-user: ${{ inputs.ssh-user }}
+        persist-credentials: ${{ inputs.persist-credentials }}
+        path: ${{ inputs.path }}
+        clean: ${{ inputs.clean }}
+        filter: ${{ inputs.filter }}
+        sparse-checkout: ${{ inputs.sparse-checkout }}
+        sparse-checkout-cone-mode: ${{ inputs.sparse-checkout-cone-mode }}
+        fetch-depth: ${{ inputs.fetch-depth }}
+        fetch-tags: ${{ inputs.fetch-tags }}
+        show-progress: ${{ inputs.show-progress }}
+        lfs: ${{ inputs.lfs }}
+        submodules: ${{ inputs.submodules }}
+        set-safe-directory: ${{ inputs.set-safe-directory }}
+        github-server-url: ${{ inputs.github-server-url }}
