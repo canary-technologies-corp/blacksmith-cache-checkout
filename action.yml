@@ -1,5 +1,5 @@
 name: 'Blacksmith Cache Checkout'
-description: 'Checkout a Git repository using Blacksmith sticky disk for caching'
+description: 'Checkout a Git repository using Blacksmith sticky disk for caching. Falls back to standard checkout on non-Blacksmith runners.'
 
 inputs:
   cache-key:
@@ -80,17 +80,34 @@ outputs:
 runs:
   using: 'composite'
   steps:
-    - name: Create .git directory
+    - name: Detect Blacksmith runner
+      id: detect
       shell: bash
-      run: mkdir -p ${{ inputs.path && format('{0}/{1}', github.workspace, inputs.path) || github.workspace }}/.git
+      run: |
+        # Blacksmith runners set BLACKSMITH_VM_ID environment variable
+        # Sticky disk only works on Linux
+        if [ -n "$BLACKSMITH_VM_ID" ] && [ "$RUNNER_OS" = "Linux" ]; then
+          echo "is-blacksmith=true" >> $GITHUB_OUTPUT
+          echo "✓ Blacksmith Linux runner detected - using sticky disk cache"
+          mkdir -p ${{ inputs.path && format('{0}/{1}', github.workspace, inputs.path) || github.workspace }}/.git
+        else
+          echo "is-blacksmith=false" >> $GITHUB_OUTPUT
+          if [ "$RUNNER_OS" != "Linux" ]; then
+            echo "⚠ Non-Linux runner ($RUNNER_OS) - skipping sticky disk cache"
+          else
+            echo "⚠ Non-Blacksmith runner - skipping sticky disk cache"
+          fi
+        fi
 
     - name: Mount sticky disk for .git
+      if: steps.detect.outputs.is-blacksmith == 'true'
       uses: useblacksmith/stickydisk@v1
       with:
         key: ${{ inputs.cache-key || format('{0}-git', github.repository) }}
         path: ${{ inputs.path && format('{0}/{1}', github.workspace, inputs.path) || github.workspace }}/.git
 
     - name: Warm up cache if empty
+      if: steps.detect.outputs.is-blacksmith == 'true'
       id: warmup
       shell: bash
       env:
