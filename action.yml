@@ -152,13 +152,6 @@ runs:
           fi
         fi
 
-        # Clear index to bypass git's cone mode directory check.
-        # Git sparse-checkout in cone mode verifies patterns are directories by
-        # checking the index. Clearing it allows file patterns like flake.lock
-        # to work without "is not a directory" errors.
-        echo "Clearing index..."
-        rm -f .git/index
-
         # Clean working tree - remove all files except .git
         # (since we use clean:false to skip checkout's reset, and git clean
         # won't remove tracked files that sparse-checkout disable restored)
