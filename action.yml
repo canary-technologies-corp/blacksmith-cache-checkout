@@ -137,25 +137,10 @@ runs:
 
         if [ ! -d ".git/objects/pack" ] || [ -z "$(ls -A .git/objects/pack 2>/dev/null)" ]; then
           echo "cache-hit=false" >> $GITHUB_OUTPUT
-          echo "Cache empty - fetching full repository..."
-          git fetch origin
+          echo "Cache empty - will fetch on checkout"
         else
-          # Unshallow if needed (one-time operation to ensure complete history)
-          if [ -f .git/shallow ]; then
-            echo "Cache has shallow history - unshallowing..."
-            if git fetch origin --unshallow; then
-              echo "cache-hit=true" >> $GITHUB_OUTPUT
-              echo "Unshallow successful"
-            else
-              echo "cache-hit=false" >> $GITHUB_OUTPUT
-              echo "⚠ Unshallow failed - wiping corrupted cache and re-fetching"
-              rm -rf .git/objects/* .git/shallow .git/refs/* .git/packed-refs 2>/dev/null || true
-              git fetch origin
-            fi
-          else
-            echo "cache-hit=true" >> $GITHUB_OUTPUT
-            echo "Cache hit - using cached objects"
-          fi
+          echo "cache-hit=true" >> $GITHUB_OUTPUT
+          echo "Cache hit - using cached objects"
         fi
 
         # Clear checkout-specific state for clean checkout
