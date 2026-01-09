@@ -153,9 +153,12 @@ runs:
         fi
 
         # Clear cached state so checkout starts fresh
-        # Keep: objects (git data), refs (branches/tags), modules (submodules)
+        # Keep: objects (git data), refs (branches/tags), modules (submodules), shallow (graft points)
         # Clear: everything else that's checkout-specific
-        rm -f .git/index .git/index.lock .git/config .git/shallow .git/FETCH_HEAD
+        # NOTE: .git/shallow MUST be kept - it marks shallow commit boundaries.
+        # Without it, git tries to walk past shallow commits and fails with
+        # "Could not read <sha>" when parent objects don't exist.
+        rm -f .git/index .git/index.lock .git/config .git/FETCH_HEAD
         rm -rf .git/info .git/hooks .git/logs
         git init
         git remote add origin "$EXPECTED_URL"
