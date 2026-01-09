@@ -140,12 +140,21 @@ runs:
           echo "Cache empty - fetching full repository..."
           git fetch origin
         else
-          echo "cache-hit=true" >> $GITHUB_OUTPUT
-          echo "Cache hit - using cached objects"
           # Unshallow if needed (one-time operation to ensure complete history)
           if [ -f .git/shallow ]; then
-            echo "Unshallowing cached repo..."
-            git fetch origin --unshallow
+            echo "Cache has shallow history - unshallowing..."
+            if git fetch origin --unshallow; then
+              echo "cache-hit=true" >> $GITHUB_OUTPUT
+              echo "Unshallow successful"
+            else
+              echo "cache-hit=false" >> $GITHUB_OUTPUT
+              echo "⚠ Unshallow failed - wiping corrupted cache and re-fetching"
+              rm -rf .git/objects/* .git/shallow .git/refs/* .git/packed-refs 2>/dev/null || true
+              git fetch origin
+            fi
+          else
+            echo "cache-hit=true" >> $GITHUB_OUTPUT
+            echo "Cache hit - using cached objects"
           fi
         fi
 
@@ -187,7 +196,7 @@ runs:
         filter: ${{ inputs.filter }}
         sparse-checkout: ${{ inputs.sparse-checkout }}
         sparse-checkout-cone-mode: ${{ inputs.sparse-checkout-cone-mode }}
-        fetch-depth: ${{ inputs.fetch-depth }}
+        fetch-depth: ${{ (steps.warmup.outputs.cache-hit == 'true' && '0') || inputs.fetch-depth }}
         fetch-tags: ${{ inputs.fetch-tags }}
         show-progress: ${{ inputs.show-progress }}
         lfs: ${{ inputs.lfs }}
