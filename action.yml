@@ -128,6 +128,7 @@ runs:
         else
           EXPECTED_URL="${SERVER_URL}/${REPO}"
         fi
+        echo "expected-url=$EXPECTED_URL" >> $GITHUB_OUTPUT
 
         if [ ! -d ".git/objects" ]; then
           echo "cache-hit=false" >> $GITHUB_OUTPUT
@@ -178,11 +179,17 @@ runs:
     - name: Clean up on cache failure
       if: steps.detect.outputs.is-blacksmith == 'true' && (steps.stickydisk.outcome == 'failure' || steps.warmup.outcome == 'failure')
       shell: bash
+      env:
+        WORKSPACE: ${{ inputs.path && format('{0}/{1}', github.workspace, inputs.path) || github.workspace }}
+        EXPECTED_URL: ${{ steps.warmup.outputs.expected-url }}
       run: |
         echo "⚠ Cache operation failed - cleaning up for fresh checkout"
-        WORKSPACE="${{ inputs.path && format('{0}/{1}', github.workspace, inputs.path) || github.workspace }}"
         # Clear contents inside .git (can't remove mounted directory itself)
         rm -rf "$WORKSPACE/.git"/* "$WORKSPACE/.git"/.[!.]* 2>/dev/null || true
+        # Re-init with correct remote URL for checkout action
+        cd "$WORKSPACE"
+        git init
+        git remote add origin "$EXPECTED_URL"
 
     - name: Checkout
       id: checkout
