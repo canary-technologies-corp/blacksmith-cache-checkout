@@ -193,7 +193,7 @@ runs:
         persist-credentials: ${{ inputs.persist-credentials }}
         path: ${{ inputs.path }}
         clean: ${{ inputs.clean }}
-        filter: ${{ inputs.filter }}
+        filter: ${{ (steps.warmup.outputs.cache-hit == 'true' && 'blob:none') || inputs.filter }}
         sparse-checkout: ${{ inputs.sparse-checkout }}
         sparse-checkout-cone-mode: ${{ inputs.sparse-checkout-cone-mode }}
         fetch-depth: ${{ (steps.warmup.outputs.cache-hit == 'true' && '0') || inputs.fetch-depth }}
