@@ -152,13 +152,13 @@ runs:
           fi
         fi
 
-        # Clear cached state so checkout starts fresh:
-        # - index: avoids "deleted" status from stale index
-        # - sparse-checkout: avoids wrong sparse patterns from previous runs
-        # - promisor/partial clone config: avoids "not our ref" errors for rebased/force-pushed commits
-        rm -f .git/index .git/index.lock .git/info/sparse-checkout
-        git config --unset remote.origin.promisorRemote 2>/dev/null || true
-        git config --unset remote.origin.partialCloneFilter 2>/dev/null || true
+        # Clear cached state so checkout starts fresh
+        # Keep: objects (git data), refs (branches/tags), modules (submodules)
+        # Clear: everything else that's checkout-specific
+        rm -f .git/index .git/index.lock .git/config .git/shallow .git/FETCH_HEAD
+        rm -rf .git/info .git/hooks .git/logs
+        git init
+        git remote add origin "$EXPECTED_URL"
 
     - name: Clean up on cache failure
       if: steps.detect.outputs.is-blacksmith == 'true' && (steps.stickydisk.outcome == 'failure' || steps.warmup.outcome == 'failure')
