@@ -181,7 +181,8 @@ runs:
       run: |
         echo "⚠ Cache operation failed - cleaning up for fresh checkout"
         WORKSPACE="${{ inputs.path && format('{0}/{1}', github.workspace, inputs.path) || github.workspace }}"
-        rm -rf "$WORKSPACE/.git"
+        # Clear contents inside .git (can't remove mounted directory itself)
+        rm -rf "$WORKSPACE/.git"/* "$WORKSPACE/.git"/.[!.]* 2>/dev/null || true
 
     - name: Checkout
       id: checkout
