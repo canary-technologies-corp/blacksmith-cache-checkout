@@ -152,8 +152,8 @@ runs:
           fi
         fi
 
-        # Reset index to match empty working tree (avoid "deleted" status)
-        git read-tree --empty
+        # Clear cached index and sparse-checkout state so checkout starts fresh
+        rm -f .git/index .git/index.lock .git/info/sparse-checkout
 
     - name: Clean up on cache failure
       if: steps.detect.outputs.is-blacksmith == 'true' && (steps.stickydisk.outcome == 'failure' || steps.warmup.outcome == 'failure')
