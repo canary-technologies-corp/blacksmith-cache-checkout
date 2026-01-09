@@ -150,14 +150,17 @@ runs:
             echo "Updating remote URL from $CURRENT_URL to $EXPECTED_URL"
             git remote set-url origin "$EXPECTED_URL"
           fi
+          # Set up credentials for fetch
+          git config --local http.${SERVER_URL}/.extraheader "AUTHORIZATION: basic $(echo -n x-access-token:${GITHUB_TOKEN} | base64)"
+          # Unshallow if needed - one-time cost to get full history, then cache stays complete
+          # This prevents "Could not read <sha>" errors from incomplete shallow commit chains
+          if [ -f .git/shallow ]; then
+            echo "Unshallowing cached repo (one-time operation)..."
+            git fetch origin --unshallow || true
+          fi
         fi
 
-        # Clear cached state so checkout starts fresh
-        # Keep: objects (git data), refs (branches/tags), modules (submodules), shallow (graft points)
-        # Clear: everything else that's checkout-specific
-        # NOTE: .git/shallow MUST be kept - it marks shallow commit boundaries.
-        # Without it, git tries to walk past shallow commits and fails with
-        # "Could not read <sha>" when parent objects don't exist.
+        # Clear checkout-specific state, keep objects and refs
         rm -f .git/index .git/index.lock .git/config .git/FETCH_HEAD
         rm -rf .git/info .git/hooks .git/logs
         git init
