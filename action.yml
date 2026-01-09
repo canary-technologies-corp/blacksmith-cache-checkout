@@ -152,6 +152,8 @@ runs:
           fi
           # Set up credentials for fetch
           git config --local http.${SERVER_URL}/.extraheader "AUTHORIZATION: basic $(echo -n x-access-token:${GITHUB_TOKEN} | base64)"
+          # Clean up any corrupted/dangling objects before unshallow
+          git gc --prune=now 2>/dev/null || true
           # Unshallow if needed - one-time cost to get full history, then cache stays complete
           # This prevents "Could not read <sha>" errors from incomplete shallow commit chains
           if [ -f .git/shallow ]; then
