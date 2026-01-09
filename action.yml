@@ -152,11 +152,8 @@ runs:
           fi
         fi
 
-        # Clean working tree - remove all files except .git
-        # (since we use clean:false to skip checkout's reset, and git clean
-        # won't remove tracked files that sparse-checkout disable restored)
-        echo "Cleaning working tree..."
-        find . -mindepth 1 -maxdepth 1 ! -name '.git' -exec rm -rf {} +
+        # Reset index to avoid "deleted" file status from cached index
+        git reset
 
     - name: Clean up on cache failure
       if: steps.detect.outputs.is-blacksmith == 'true' && (steps.stickydisk.outcome == 'failure' || steps.warmup.outcome == 'failure')
