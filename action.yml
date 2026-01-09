@@ -130,48 +130,27 @@ runs:
         fi
         echo "expected-url=$EXPECTED_URL" >> $GITHUB_OUTPUT
 
-        if [ ! -d ".git/objects" ]; then
-          echo "cache-hit=false" >> $GITHUB_OUTPUT
-          echo "Cache empty - warming up"
-          git init
-          git remote add origin "$EXPECTED_URL"
-          # Use token via credential helper for fetch
-          git config --local http.${SERVER_URL}/.extraheader "AUTHORIZATION: basic $(echo -n x-access-token:${GITHUB_TOKEN} | base64)"
-          # Fetch entire repo for cache warmup (checkout will handle depth)
-          git fetch origin
-          # Set HEAD without checking out files (checkout action will handle working tree)
-          git symbolic-ref HEAD refs/heads/__temp_branch
-          git update-ref refs/heads/__temp_branch FETCH_HEAD
-        else
-          echo "Cache hit"
-          # Update remote URL if it doesn't match expected format
-          CURRENT_URL=$(git remote get-url origin 2>/dev/null || echo "")
-          if [ "$CURRENT_URL" != "$EXPECTED_URL" ]; then
-            echo "Updating remote URL from $CURRENT_URL to $EXPECTED_URL"
-            git remote set-url origin "$EXPECTED_URL"
-          fi
-          # Set up credentials for fetch
-          git config --local http.${SERVER_URL}/.extraheader "AUTHORIZATION: basic $(echo -n x-access-token:${GITHUB_TOKEN} | base64)"
+        # Set up git repo
+        git init
+        git remote add origin "$EXPECTED_URL" 2>/dev/null || git remote set-url origin "$EXPECTED_URL"
+        git config --local http.${SERVER_URL}/.extraheader "AUTHORIZATION: basic $(echo -n x-access-token:${GITHUB_TOKEN} | base64)"
 
-          # Unshallow if needed - one-time cost to get full history, then cache stays complete
+        if [ ! -d ".git/objects/pack" ] || [ -z "$(ls -A .git/objects/pack 2>/dev/null)" ]; then
+          echo "cache-hit=false" >> $GITHUB_OUTPUT
+          echo "Cache empty - fetching full repository..."
+          git fetch origin
+        else
+          echo "cache-hit=true" >> $GITHUB_OUTPUT
+          echo "Cache hit - using cached objects"
+          # Unshallow if needed (one-time operation to ensure complete history)
           if [ -f .git/shallow ]; then
-            echo "Unshallowing cached repo (one-time operation)..."
-            if git fetch origin --unshallow; then
-              echo "cache-hit=true" >> $GITHUB_OUTPUT
-            else
-              echo "⚠ Unshallow failed - cache corrupted, wiping objects and re-fetching"
-              rm -rf .git/objects .git/shallow
-              mkdir -p .git/objects
-              git fetch origin
-              echo "cache-hit=false" >> $GITHUB_OUTPUT
-            fi
-          else
-            echo "cache-hit=true" >> $GITHUB_OUTPUT
+            echo "Unshallowing cached repo..."
+            git fetch origin --unshallow
           fi
         fi
 
-        # Clear checkout-specific state, keep objects and refs
-        rm -f .git/index .git/index.lock .git/config .git/FETCH_HEAD
+        # Clear checkout-specific state for clean checkout
+        rm -f .git/index .git/index.lock .git/config .git/FETCH_HEAD .git/shallow
         rm -rf .git/info .git/hooks .git/logs
         git init
         git remote add origin "$EXPECTED_URL"
