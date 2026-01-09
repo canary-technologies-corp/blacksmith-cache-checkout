@@ -142,7 +142,6 @@ runs:
           git symbolic-ref HEAD refs/heads/__temp_branch
           git update-ref refs/heads/__temp_branch FETCH_HEAD
         else
-          echo "cache-hit=true" >> $GITHUB_OUTPUT
           echo "Cache hit"
           # Update remote URL if it doesn't match expected format
           CURRENT_URL=$(git remote get-url origin 2>/dev/null || echo "")
@@ -152,13 +151,21 @@ runs:
           fi
           # Set up credentials for fetch
           git config --local http.${SERVER_URL}/.extraheader "AUTHORIZATION: basic $(echo -n x-access-token:${GITHUB_TOKEN} | base64)"
-          # Clean up any corrupted/dangling objects before unshallow
-          git gc --prune=now 2>/dev/null || true
+
           # Unshallow if needed - one-time cost to get full history, then cache stays complete
-          # This prevents "Could not read <sha>" errors from incomplete shallow commit chains
           if [ -f .git/shallow ]; then
             echo "Unshallowing cached repo (one-time operation)..."
-            git fetch origin --unshallow || true
+            if git fetch origin --unshallow; then
+              echo "cache-hit=true" >> $GITHUB_OUTPUT
+            else
+              echo "⚠ Unshallow failed - cache corrupted, wiping objects and re-fetching"
+              rm -rf .git/objects .git/shallow
+              mkdir -p .git/objects
+              git fetch origin
+              echo "cache-hit=false" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "cache-hit=true" >> $GITHUB_OUTPUT
           fi
         fi
 
