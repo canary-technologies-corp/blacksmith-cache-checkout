@@ -152,8 +152,8 @@ runs:
           fi
         fi
 
-        # Reset index to avoid "deleted" file status from cached index
-        git reset
+        # Remove cached index to avoid "deleted" file status mismatch
+        rm -f .git/index
 
     - name: Clean up on cache failure
       if: steps.detect.outputs.is-blacksmith == 'true' && (steps.stickydisk.outcome == 'failure' || steps.warmup.outcome == 'failure')
