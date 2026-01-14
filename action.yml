@@ -108,7 +108,7 @@ runs:
         key: ${{ inputs.cache-key || format('{0}-git', github.repository) }}
         path: ${{ inputs.path && format('{0}/{1}', github.workspace, inputs.path) || github.workspace }}/.git
 
-    - name: Warm up cache if empty
+    - name: Warm up and validate cache
       id: warmup
       if: steps.detect.outputs.is-blacksmith == 'true' && steps.stickydisk.outcome == 'success'
       continue-on-error: true
@@ -130,24 +130,41 @@ runs:
         fi
         echo "expected-url=$EXPECTED_URL" >> $GITHUB_OUTPUT
 
-        # Set up git repo
+        # Initialize git repo structure
         git init
         git remote add origin "$EXPECTED_URL" 2>/dev/null || git remote set-url origin "$EXPECTED_URL"
-        git config --local http.${SERVER_URL}/.extraheader "AUTHORIZATION: basic $(echo -n x-access-token:${GITHUB_TOKEN} | base64)"
 
+        # Check if cache has objects
         if [ ! -d ".git/objects/pack" ] || [ -z "$(ls -A .git/objects/pack 2>/dev/null)" ]; then
           echo "cache-hit=false" >> $GITHUB_OUTPUT
           echo "Cache empty - will fetch on checkout"
         else
-          echo "cache-hit=true" >> $GITHUB_OUTPUT
-          echo "Cache hit - using cached objects"
+          echo "Found cached pack files, validating integrity..."
+
+          # Validate the cache integrity with a connectivity check
+          # This catches the "Could not read <sha>" errors before checkout tries to use it
+          if git fsck --connectivity-only 2>/dev/null; then
+            echo "cache-hit=true" >> $GITHUB_OUTPUT
+            echo "✓ Cache validated - using cached objects"
+          else
+            echo "⚠ Cache corrupted - clearing objects for fresh fetch"
+            echo "cache-hit=false" >> $GITHUB_OUTPUT
+            # Clear the corrupted objects but keep the directory structure
+            rm -rf .git/objects/pack/* .git/objects/info/* 2>/dev/null || true
+            find .git/objects -type f -name '??' -delete 2>/dev/null || true
+          fi
         fi
 
         # Clear checkout-specific state for clean checkout
-        rm -f .git/index .git/index.lock .git/config .git/FETCH_HEAD .git/shallow
+        # BUT preserve .git/shallow if it exists - removing it causes issues
+        # when cache contains shallow history but we then request full depth
+        rm -f .git/index .git/index.lock .git/config .git/FETCH_HEAD
         rm -rf .git/info .git/hooks .git/logs
+
+        # Re-initialize with correct remote
         git init
         git remote add origin "$EXPECTED_URL"
+        git config --local http.${SERVER_URL}/.extraheader "AUTHORIZATION: basic $(echo -n x-access-token:${GITHUB_TOKEN} | base64)"
 
     - name: Clean up on cache failure
       if: steps.detect.outputs.is-blacksmith == 'true' && (steps.stickydisk.outcome == 'failure' || steps.warmup.outcome == 'failure')
@@ -162,7 +179,9 @@ runs:
         # Re-init with correct remote URL for checkout action
         cd "$WORKSPACE"
         git init
-        git remote add origin "$EXPECTED_URL"
+        if [ -n "$EXPECTED_URL" ]; then
+          git remote add origin "$EXPECTED_URL"
+        fi
 
     - name: Checkout
       id: checkout
@@ -178,10 +197,10 @@ runs:
         persist-credentials: ${{ inputs.persist-credentials }}
         path: ${{ inputs.path }}
         clean: ${{ inputs.clean }}
-        filter: ${{ (steps.warmup.outputs.cache-hit == 'true' && 'blob:none') || inputs.filter }}
+        filter: ${{ inputs.filter }}
         sparse-checkout: ${{ inputs.sparse-checkout }}
         sparse-checkout-cone-mode: ${{ inputs.sparse-checkout-cone-mode }}
-        fetch-depth: ${{ (steps.warmup.outputs.cache-hit == 'true' && '0') || inputs.fetch-depth }}
+        fetch-depth: ${{ inputs.fetch-depth }}
         fetch-tags: ${{ inputs.fetch-tags }}
         show-progress: ${{ inputs.show-progress }}
         lfs: ${{ inputs.lfs }}
