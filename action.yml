@@ -186,10 +186,13 @@ runs:
           CHECKOUT_REF="-B $REF refs/remotes/origin/$REF"
         fi
 
-        # === Init and fetch ===
+        # === Init ===
+        INIT_START=$(date +%s)
         echo "🚀 Initializing repository"
         git init --quiet
         git remote add origin "$REPO_URL"
+        INIT_END=$(date +%s)
+        echo "::notice::Init completed in $((INIT_END - INIT_START))s"
 
         # Use mirror as alternate object store if available
         if [ "$USE_MIRROR" = "true" ] && [ -d "$MIRROR_PATH/objects" ]; then
@@ -198,6 +201,8 @@ runs:
           echo "📦 Using mirror as alternate object store"
         fi
 
+        # === Fetch ===
+        FETCH_START=$(date +%s)
         echo "📥 Fetching $REF"
         if ! git_auth fetch origin $DEPTH_ARG --prune $REFSPEC; then
           # Fallback: unset alternates and retry
@@ -210,12 +215,11 @@ runs:
             exit 1
           fi
         fi
-
         FETCH_END=$(date +%s)
-        FETCH_DURATION=$((FETCH_END - FETCH_START))
-        echo "::notice::Fetch completed in ${FETCH_DURATION}s (method: $FETCH_METHOD)"
+        echo "::notice::Fetch completed in $((FETCH_END - FETCH_START))s (method: $FETCH_METHOD)"
 
         # === Checkout ===
+        CHECKOUT_START=$(date +%s)
         if [ -n "$CHECKOUT_REF" ]; then
           echo "🔀 Checking out $REF"
           git checkout --progress --force $CHECKOUT_REF
@@ -225,6 +229,8 @@ runs:
           echo "🔀 Checking out default branch: $DEFAULT_BRANCH"
           git checkout --progress --force -B "$DEFAULT_BRANCH" "refs/remotes/origin/$DEFAULT_BRANCH"
         fi
+        CHECKOUT_END=$(date +%s)
+        echo "::notice::Checkout completed in $((CHECKOUT_END - CHECKOUT_START))s"
 
         # === Persist credentials ===
         echo "🔑 Persisting credentials"
