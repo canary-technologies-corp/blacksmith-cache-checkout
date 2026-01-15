@@ -37,6 +37,8 @@ outputs:
 
 runs:
   using: 'composite'
+  env:
+    MIRROR_PATH: /tmp/git-mirror
   steps:
     - name: Detect Blacksmith runner
       id: detect
@@ -55,7 +57,7 @@ runs:
       uses: useblacksmith/stickydisk@v1
       with:
         key: ${{ format('v1-{0}-git-mirror', inputs.repository) }}
-        path: /tmp/git-mirror
+        path: ${{ env.MIRROR_PATH }}
 
     - name: Checkout
       id: checkout
@@ -67,7 +69,6 @@ runs:
         SSH_KEY: ${{ inputs.ssh-key }}
         FETCH_DEPTH: ${{ inputs.fetch-depth }}
         WORKSPACE: ${{ inputs.path && format('{0}/{1}', github.workspace, inputs.path) || github.workspace }}
-        MIRROR_PATH: /tmp/git-mirror
         REFRESH_CACHE: ${{ inputs.refresh-cache }}
         USE_MIRROR: ${{ steps.detect.outputs.is-blacksmith == 'true' && steps.stickydisk.outcome == 'success' }}
         CLEAN: ${{ inputs.clean }}
