@@ -77,7 +77,7 @@ runs:
         # === Debug helper ===
         debug_mirror_stats() {
           local label="$1"
-          if [ "$RUNNER_DEBUG" = "1" ] && [ -d "$MIRROR_PATH/objects" ]; then
+          if [ "${RUNNER_DEBUG:-}" = "1" ] && [ -d "$MIRROR_PATH/objects" ]; then
             echo "::debug::Mirror size ($label): $(du -sh "$MIRROR_PATH" 2>/dev/null | cut -f1 || echo "unknown")"
             echo "::debug::Mirror objects ($label): $(git -C "$MIRROR_PATH" count-objects -v | grep in-pack | awk '{print $2}')"
           fi
