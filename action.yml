@@ -86,12 +86,6 @@ runs:
         # === Debug: show mirror stats at start ===
         [ "$USE_MIRROR" = "true" ] && debug_mirror_stats "before"
 
-        # === Refresh cache mode ===
-        if [ "$REFRESH_CACHE" = "true" ] && [ "$USE_MIRROR" = "true" ]; then
-          echo "🔄 Refresh mode: clearing mirror cache"
-          rm -rf "$MIRROR_PATH"/* "$MIRROR_PATH"/.[!.]* 2>/dev/null || true
-        fi
-
         # === Setup auth (from actions/checkout) ===
         if [ -n "$SSH_KEY" ]; then
           # SSH auth
