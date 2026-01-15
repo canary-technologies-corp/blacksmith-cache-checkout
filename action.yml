@@ -152,12 +152,12 @@ runs:
 
         # Try with reference first, fallback to plain clone
         CLONE_SUCCESS=false
+        VERBOSE_ARG=""
+        [ "${RUNNER_DEBUG:-}" = "1" ] && VERBOSE_ARG="--verbose"
 
         if [ "$USE_MIRROR" = "true" ] && [ -d "$MIRROR_PATH/objects" ]; then
-          echo "🚀 Cloning with reference (--reference-if-able --dissociate)"
-          # --reference-if-able: warns but continues if reference unavailable
-          # --dissociate: copies objects locally, removes alternates dependency
-          if git_auth clone $DEPTH_ARG --reference-if-able "$MIRROR_PATH" --dissociate "$REPO_URL" .; then
+          echo "🚀 Cloning with reference"
+          if git_auth clone $DEPTH_ARG $VERBOSE_ARG --reference-if-able "$MIRROR_PATH" "$REPO_URL" .; then
             CLONE_SUCCESS=true
             echo "✅ Clone with reference succeeded"
           else
@@ -168,7 +168,7 @@ runs:
 
         if [ "$CLONE_SUCCESS" = "false" ]; then
           echo "📥 Cloning without reference"
-          git_auth clone $DEPTH_ARG "$REPO_URL" .
+          git_auth clone $DEPTH_ARG $VERBOSE_ARG "$REPO_URL" .
         fi
 
         # === Checkout specific ref ===
