@@ -133,7 +133,7 @@ runs:
           debug_mirror_stats "after"
         fi
 
-        # === Clone workspace ===
+        # === Setup workspace ===
         mkdir -p "$WORKSPACE"
         cd "$WORKSPACE"
 
@@ -150,99 +150,80 @@ runs:
         DEPTH_ARG=""
         [ "$FETCH_DEPTH" != "0" ] && DEPTH_ARG="--depth $FETCH_DEPTH"
 
-        # Try with reference first, fallback to plain clone
-        CLONE_SUCCESS=false
-        CLONE_METHOD=""
-        VERBOSE_ARG=""
-        [ "${RUNNER_DEBUG:-}" = "1" ] && VERBOSE_ARG="--verbose"
-        CLONE_START=$(date +%s)
+        FETCH_START=$(date +%s)
+        FETCH_METHOD="plain"
 
+        # === Build refspec based on REF type ===
+        SHA_PATTERN='^[0-9a-fA-F]{40}$'
+        if [ -z "$REF" ]; then
+          # No ref specified - fetch default branch
+          REFSPEC="+refs/heads/*:refs/remotes/origin/*"
+          CHECKOUT_REF=""
+        elif [[ "$REF" =~ $SHA_PATTERN ]]; then
+          # SHA - fetch it directly
+          REFSPEC="$REF"
+          CHECKOUT_REF="$REF"
+        elif [[ "$REF" == refs/heads/* ]]; then
+          # Branch
+          BRANCH_NAME="${REF#refs/heads/}"
+          REFSPEC="+$REF:refs/remotes/origin/$BRANCH_NAME"
+          CHECKOUT_REF="-B $BRANCH_NAME refs/remotes/origin/$BRANCH_NAME"
+        elif [[ "$REF" == refs/pull/*/head ]] || [[ "$REF" == refs/pull/*/merge ]]; then
+          # PR ref
+          REFSPEC="+$REF:refs/remotes/origin/${REF#refs/}"
+          CHECKOUT_REF="FETCH_HEAD"
+        elif [[ "$REF" == refs/tags/* ]]; then
+          # Tag
+          REFSPEC="+$REF:$REF"
+          CHECKOUT_REF="$REF"
+        elif [[ "$REF" == refs/* ]]; then
+          # Other ref
+          REFSPEC="+$REF:$REF"
+          CHECKOUT_REF="FETCH_HEAD"
+        else
+          # Unqualified - assume branch
+          REFSPEC="+refs/heads/$REF:refs/remotes/origin/$REF"
+          CHECKOUT_REF="-B $REF refs/remotes/origin/$REF"
+        fi
+
+        # === Init and fetch ===
+        echo "🚀 Initializing repository"
+        git init --quiet
+        git remote add origin "$REPO_URL"
+
+        # Use mirror as alternate object store if available
         if [ "$USE_MIRROR" = "true" ] && [ -d "$MIRROR_PATH/objects" ]; then
-          echo "🚀 Cloning with reference"
-          # Note: --dissociate is safer (copies objects, immune to cache corruption) but slower.
-          # We skip it for speed; fallback clone handles corrupted cache cases.
-          if git_auth clone $DEPTH_ARG $VERBOSE_ARG --reference-if-able "$MIRROR_PATH" "$REPO_URL" .; then
-            CLONE_SUCCESS=true
-            CLONE_METHOD="reference"
+          export GIT_ALTERNATE_OBJECT_DIRECTORIES="$MIRROR_PATH/objects"
+          FETCH_METHOD="cached"
+          echo "📦 Using mirror as alternate object store"
+        fi
+
+        echo "📥 Fetching $REF"
+        if ! git_auth fetch origin $DEPTH_ARG --prune $REFSPEC; then
+          # Fallback: unset alternates and retry
+          if [ "$FETCH_METHOD" = "cached" ]; then
+            echo "⚠️ Fetch with cache failed, retrying without"
+            unset GIT_ALTERNATE_OBJECT_DIRECTORIES
+            FETCH_METHOD="plain"
+            git_auth fetch origin $DEPTH_ARG --prune $REFSPEC
           else
-            echo "⚠️ Clone with reference failed, falling back to plain clone"
-            rm -rf .git 2>/dev/null || true
+            exit 1
           fi
         fi
 
-        if [ "$CLONE_SUCCESS" = "false" ]; then
-          echo "📥 Cloning without reference"
-          git_auth clone $DEPTH_ARG $VERBOSE_ARG "$REPO_URL" .
-          CLONE_METHOD="plain"
-        fi
+        FETCH_END=$(date +%s)
+        FETCH_DURATION=$((FETCH_END - FETCH_START))
+        echo "::notice::Fetch completed in ${FETCH_DURATION}s (method: $FETCH_METHOD)"
 
-        CLONE_END=$(date +%s)
-        CLONE_DURATION=$((CLONE_END - CLONE_START))
-        echo "::notice::Clone completed in ${CLONE_DURATION}s (method: $CLONE_METHOD)"
-
-        # === Checkout specific ref ===
-        if [ -n "$REF" ]; then
-          # Check if already on correct ref (clone may have checked it out)
-          CURRENT_SHA=$(git rev-parse HEAD 2>/dev/null || true)
-          TARGET_SHA=$(git rev-parse "$REF" 2>/dev/null || true)
-
-          if [ -n "$TARGET_SHA" ] && [ "$CURRENT_SHA" = "$TARGET_SHA" ]; then
-            echo "🔀 Already on $REF"
-          else
-            # Determine ref type
-            SHA_PATTERN='^[0-9a-fA-F]{40}$'
-
-            if [[ "$REF" =~ $SHA_PATTERN ]]; then
-              REF_TYPE="sha"
-            elif [[ "$REF" == refs/heads/* ]]; then
-              REF_TYPE="branch"
-              BRANCH_NAME="${REF#refs/heads/}"
-            elif [[ "$REF" == refs/pull/*/head ]] || [[ "$REF" == refs/pull/*/merge ]]; then
-              REF_TYPE="pr"
-            elif [[ "$REF" == refs/tags/* ]]; then
-              REF_TYPE="tag"
-            elif [[ "$REF" == refs/* ]]; then
-              REF_TYPE="ref"
-            else
-              REF_TYPE="unqualified"
-            fi
-
-            echo "🔀 Checking out $REF (type: $REF_TYPE)"
-
-            case "$REF_TYPE" in
-              sha)
-                # Fetch specific commit - may need to deepen for shallow clones
-                if [ "$FETCH_DEPTH" != "0" ]; then
-                  git_auth fetch --depth=1 origin "$REF" 2>/dev/null || git_auth fetch --unshallow origin 2>/dev/null || git_auth fetch origin
-                else
-                  git_auth fetch origin
-                fi
-                git checkout "$REF" --quiet
-                ;;
-              branch)
-                git_auth fetch origin "$REF" $DEPTH_ARG
-                git checkout -B "$BRANCH_NAME" FETCH_HEAD --quiet
-                ;;
-              pr)
-                # PR refs need explicit refspec
-                git_auth fetch origin "+$REF:refs/remotes/origin/${REF#refs/}" $DEPTH_ARG
-                git checkout FETCH_HEAD --quiet
-                ;;
-              tag)
-                git_auth fetch origin "$REF:$REF" --no-tags $DEPTH_ARG
-                git checkout "$REF" --quiet
-                ;;
-              ref)
-                git_auth fetch origin "+$REF:$REF" $DEPTH_ARG
-                git checkout FETCH_HEAD --quiet
-                ;;
-              *)
-                # Unqualified - let git figure it out
-                git_auth fetch origin "$REF" $DEPTH_ARG 2>/dev/null || git_auth fetch origin "refs/heads/$REF" $DEPTH_ARG 2>/dev/null || git_auth fetch origin "refs/tags/$REF" $DEPTH_ARG
-                git checkout "$REF" --quiet 2>/dev/null || git checkout FETCH_HEAD --quiet
-                ;;
-            esac
-          fi
+        # === Checkout ===
+        if [ -n "$CHECKOUT_REF" ]; then
+          echo "🔀 Checking out $REF"
+          git checkout --progress --force $CHECKOUT_REF
+        else
+          # No specific ref - checkout default branch
+          DEFAULT_BRANCH=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@' || echo "main")
+          echo "🔀 Checking out default branch: $DEFAULT_BRANCH"
+          git checkout --progress --force -B "$DEFAULT_BRANCH" "refs/remotes/origin/$DEFAULT_BRANCH"
         fi
 
         # === Persist credentials ===
