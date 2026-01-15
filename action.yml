@@ -156,9 +156,10 @@ runs:
         # === Build refspec based on REF type ===
         SHA_PATTERN='^[0-9a-fA-F]{40}$'
         if [ -z "$REF" ]; then
-          # No ref specified - fetch default branch
-          REFSPEC="+refs/heads/*:refs/remotes/origin/*"
-          CHECKOUT_REF=""
+          # No ref specified - determine and fetch default branch only
+          DEFAULT_BRANCH=$(git ls-remote --symref origin HEAD 2>/dev/null | grep "ref:" | sed 's/.*refs\/heads\/\([^[:space:]]*\).*/\1/' || echo "main")
+          REFSPEC="+refs/heads/$DEFAULT_BRANCH:refs/remotes/origin/$DEFAULT_BRANCH"
+          CHECKOUT_REF="-B $DEFAULT_BRANCH refs/remotes/origin/$DEFAULT_BRANCH"
         elif [[ "$REF" =~ $SHA_PATTERN ]]; then
           # SHA - fetch it directly
           REFSPEC="$REF"
@@ -204,13 +205,17 @@ runs:
         # === Fetch ===
         FETCH_START=$(date +%s)
         echo "📥 Fetching $REF"
-        if ! git_auth fetch origin $DEPTH_ARG --prune $REFSPEC; then
+        # --no-tags: don't fetch tags unless explicitly requested
+        # --no-recurse-submodules: skip submodules
+        # protocol.version=2: more efficient negotiation
+        FETCH_ARGS="-c protocol.version=2 fetch origin --no-tags --prune --no-recurse-submodules --progress $DEPTH_ARG $REFSPEC"
+        if ! git_auth $FETCH_ARGS; then
           # Fallback: unset alternates and retry
           if [ "$FETCH_METHOD" = "cached" ]; then
             echo "⚠️ Fetch with cache failed, retrying without"
             unset GIT_ALTERNATE_OBJECT_DIRECTORIES
             FETCH_METHOD="plain"
-            git_auth fetch origin $DEPTH_ARG --prune $REFSPEC
+            git_auth $FETCH_ARGS
           else
             exit 1
           fi
@@ -220,15 +225,8 @@ runs:
 
         # === Checkout ===
         CHECKOUT_START=$(date +%s)
-        if [ -n "$CHECKOUT_REF" ]; then
-          echo "🔀 Checking out $REF"
-          git checkout --progress --force $CHECKOUT_REF
-        else
-          # No specific ref - checkout default branch
-          DEFAULT_BRANCH=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@' || echo "main")
-          echo "🔀 Checking out default branch: $DEFAULT_BRANCH"
-          git checkout --progress --force -B "$DEFAULT_BRANCH" "refs/remotes/origin/$DEFAULT_BRANCH"
-        fi
+        echo "🔀 Checking out ${REF:-${DEFAULT_BRANCH:-default}}"
+        git checkout --progress --force $CHECKOUT_REF
         CHECKOUT_END=$(date +%s)
         echo "Checkout completed in $((CHECKOUT_END - CHECKOUT_START))s"
         echo "::notice::Checkout completed in $((CHECKOUT_END - CHECKOUT_TOTAL_START))s (method: $FETCH_METHOD)"
