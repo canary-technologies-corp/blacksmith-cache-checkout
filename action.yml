@@ -74,6 +74,18 @@ runs:
       run: |
         set -euo pipefail
 
+        # === Debug helper ===
+        debug_mirror_stats() {
+          local label="$1"
+          if [ "$RUNNER_DEBUG" = "1" ] && [ -d "$MIRROR_PATH/objects" ]; then
+            echo "::debug::Mirror size ($label): $(du -sh "$MIRROR_PATH" 2>/dev/null | cut -f1 || echo "unknown")"
+            echo "::debug::Mirror objects ($label): $(git -C "$MIRROR_PATH" count-objects -v | grep in-pack | awk '{print $2}')"
+          fi
+        }
+
+        # === Debug: show mirror stats at start ===
+        [ "$USE_MIRROR" = "true" ] && debug_mirror_stats "before"
+
         # === Refresh cache mode ===
         if [ "$REFRESH_CACHE" = "true" ] && [ "$USE_MIRROR" = "true" ]; then
           echo "🔄 Refresh mode: clearing mirror cache"
@@ -125,8 +137,6 @@ runs:
                 rm -rf "$MIRROR_PATH"/* "$MIRROR_PATH"/.[!.]* 2>/dev/null || true
                 git_auth clone --mirror "$REPO_URL" "$MIRROR_PATH" || true
               fi
-              MIRROR_SIZE=$(du -sh "$MIRROR_PATH" 2>/dev/null | cut -f1 || echo "unknown")
-              echo "📊 Mirror size: $MIRROR_SIZE"
             else
               echo "📦 Initializing mirror cache"
               # Full mirror (no --filter) so blobs are available for --reference clones
@@ -135,9 +145,7 @@ runs:
           else
             echo "📦 Using existing mirror cache"
           fi
-          if [ "$RUNNER_DEBUG" = "1" ]; then
-            echo "::debug::Mirror object count: $(git -C "$MIRROR_PATH" count-objects -v | grep in-pack | awk '{print $2}')"
-          fi
+          debug_mirror_stats "after"
         fi
 
         # === Clone workspace ===
