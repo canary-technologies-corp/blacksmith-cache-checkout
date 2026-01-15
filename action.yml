@@ -2,80 +2,38 @@ name: 'Blacksmith Cache Checkout'
 description: 'Checkout a Git repository using Blacksmith sticky disk for caching. Falls back to standard checkout on non-Blacksmith runners or cache failures.'
 
 inputs:
-  cache-key:
-    description: 'Key for the sticky disk cache'
-    required: false
   repository:
-    description: 'Repository name with owner'
+    description: 'Repository name with owner (e.g., owner/repo)'
     default: ${{ github.repository }}
   ref:
-    description: 'The branch, tag or SHA to checkout'
+    description: 'Branch, tag, or SHA to checkout'
     required: false
   token:
-    description: 'Personal access token'
+    description: 'GitHub token for HTTPS auth'
     default: ${{ github.token }}
   ssh-key:
-    description: 'SSH key for fetching'
+    description: 'SSH private key for SSH auth'
     required: false
-  ssh-known-hosts:
-    description: 'Known hosts for SSH'
-    required: false
-  ssh-strict:
-    description: 'Strict host key checking'
-    default: 'true'
-  ssh-user:
-    description: 'SSH user'
-    default: 'git'
-  persist-credentials:
-    description: 'Persist credentials'
-    default: 'true'
+  fetch-depth:
+    description: 'Number of commits to fetch (0 for full history)'
+    default: '1'
   path:
     description: 'Relative path to checkout'
     required: false
+  refresh-cache:
+    description: 'Clear cache and re-clone fresh (use to fix poisoned cache)'
+    default: 'false'
   clean:
-    description: 'Clean before fetch (default false for cache efficiency)'
-    default: 'false'
-  filter:
-    description: 'Partial clone filter'
-    required: false
-  sparse-checkout:
-    description: 'Sparse checkout patterns'
-    required: false
-  sparse-checkout-cone-mode:
-    description: 'Cone mode for sparse checkout'
+    description: 'Remove untracked files before checkout'
     default: 'true'
-  fetch-depth:
-    description: 'Number of commits to fetch'
-    default: '1'
-  fetch-tags:
-    description: 'Fetch tags'
-    default: 'false'
-  show-progress:
-    description: 'Show progress'
-    default: 'true'
-  lfs:
-    description: 'Download Git-LFS files'
-    default: 'false'
-  submodules:
-    description: 'Checkout submodules'
-    default: 'false'
-  set-safe-directory:
-    description: 'Set safe directory'
-    default: 'true'
-  github-server-url:
-    description: 'GitHub server URL'
-    required: false
 
 outputs:
   ref:
-    description: 'The branch, tag or SHA that was checked out'
+    description: 'Branch or SHA checked out'
     value: ${{ steps.checkout.outputs.ref }}
   commit:
-    description: 'The commit SHA that was checked out'
+    description: 'Commit SHA checked out'
     value: ${{ steps.checkout.outputs.commit }}
-  cache-hit:
-    description: 'Whether the sticky disk cache was hit'
-    value: ${{ steps.warmup.outputs.cache-hit || 'false' }}
 
 runs:
   using: 'composite'
@@ -84,126 +42,236 @@ runs:
       id: detect
       shell: bash
       run: |
-        # Blacksmith runners set BLACKSMITH_VM_ID environment variable
-        # Sticky disk only works on Linux
         if [ -n "$BLACKSMITH_VM_ID" ] && [ "$RUNNER_OS" = "Linux" ]; then
           echo "is-blacksmith=true" >> $GITHUB_OUTPUT
-          echo "✓ Blacksmith Linux runner detected - using sticky disk cache"
-          mkdir -p ${{ inputs.path && format('{0}/{1}', github.workspace, inputs.path) || github.workspace }}/.git
         else
           echo "is-blacksmith=false" >> $GITHUB_OUTPUT
-          if [ "$RUNNER_OS" != "Linux" ]; then
-            echo "⚠ Non-Linux runner ($RUNNER_OS) - skipping sticky disk cache"
-          else
-            echo "⚠ Non-Blacksmith runner - skipping sticky disk cache"
-          fi
         fi
 
-    - name: Mount sticky disk for .git
+    - name: Mount sticky disk
       id: stickydisk
       if: steps.detect.outputs.is-blacksmith == 'true'
       continue-on-error: true
       uses: useblacksmith/stickydisk@v1
       with:
-        key: ${{ inputs.cache-key || format('{0}-git', github.repository) }}
-        path: ${{ inputs.path && format('{0}/{1}', github.workspace, inputs.path) || github.workspace }}/.git
-
-    - name: Warm up and validate cache
-      id: warmup
-      if: steps.detect.outputs.is-blacksmith == 'true' && steps.stickydisk.outcome == 'success'
-      continue-on-error: true
-      shell: bash
-      env:
-        GITHUB_TOKEN: ${{ inputs.token }}
-        REPO: ${{ inputs.repository }}
-        SERVER_URL: ${{ inputs.github-server-url || 'https://github.com' }}
-        WORKSPACE: ${{ inputs.path && format('{0}/{1}', github.workspace, inputs.path) || github.workspace }}
-        SSH_KEY: ${{ inputs.ssh-key }}
-      run: |
-        cd "$WORKSPACE"
-
-        # Determine expected URL format (SSH when ssh-key provided, HTTPS otherwise)
-        if [ -n "$SSH_KEY" ]; then
-          EXPECTED_URL="git@github.com:${REPO}.git"
-        else
-          EXPECTED_URL="${SERVER_URL}/${REPO}"
-        fi
-        echo "expected-url=$EXPECTED_URL" >> $GITHUB_OUTPUT
-
-        # Initialize git repo structure
-        git init
-        git remote add origin "$EXPECTED_URL" 2>/dev/null || git remote set-url origin "$EXPECTED_URL"
-
-        # Check if cache has objects
-        if [ ! -d ".git/objects/pack" ] || [ -z "$(ls -A .git/objects/pack 2>/dev/null)" ]; then
-          echo "cache-hit=false" >> $GITHUB_OUTPUT
-          echo "Cache empty - will fetch on checkout"
-        else
-          echo "Found cached pack files, validating integrity..."
-
-          # Validate the cache integrity with a connectivity check
-          # This catches the "Could not read <sha>" errors before checkout tries to use it
-          if git fsck --connectivity-only 2>/dev/null; then
-            echo "cache-hit=true" >> $GITHUB_OUTPUT
-            echo "✓ Cache validated - using cached objects"
-          else
-            echo "⚠ Cache corrupted - clearing objects for fresh fetch"
-            echo "cache-hit=false" >> $GITHUB_OUTPUT
-            # Clear the corrupted objects but keep the directory structure
-            rm -rf .git/objects/pack/* .git/objects/info/* 2>/dev/null || true
-            find .git/objects -type f -name '??' -delete 2>/dev/null || true
-          fi
-        fi
-
-        # Clear checkout-specific state for clean checkout
-        # BUT preserve .git/shallow if it exists - removing it causes issues
-        # when cache contains shallow history but we then request full depth
-        rm -f .git/index .git/index.lock .git/config .git/FETCH_HEAD
-        rm -rf .git/info .git/hooks .git/logs
-
-        # Re-initialize with correct remote
-        git init
-        git remote add origin "$EXPECTED_URL"
-        git config --local http.${SERVER_URL}/.extraheader "AUTHORIZATION: basic $(echo -n x-access-token:${GITHUB_TOKEN} | base64)"
-
-    - name: Clean up on cache failure
-      if: steps.detect.outputs.is-blacksmith == 'true' && (steps.stickydisk.outcome == 'failure' || steps.warmup.outcome == 'failure')
-      shell: bash
-      env:
-        WORKSPACE: ${{ inputs.path && format('{0}/{1}', github.workspace, inputs.path) || github.workspace }}
-        EXPECTED_URL: ${{ steps.warmup.outputs.expected-url }}
-      run: |
-        echo "⚠ Cache operation failed - cleaning up for fresh checkout"
-        # Clear contents inside .git (can't remove mounted directory itself)
-        rm -rf "$WORKSPACE/.git"/* "$WORKSPACE/.git"/.[!.]* 2>/dev/null || true
-        # Re-init with correct remote URL for checkout action
-        cd "$WORKSPACE"
-        git init
-        if [ -n "$EXPECTED_URL" ]; then
-          git remote add origin "$EXPECTED_URL"
-        fi
+        key: ${{ format('v1-{0}-git-mirror', inputs.repository) }}
+        path: /tmp/git-mirror
 
     - name: Checkout
       id: checkout
-      uses: actions/checkout@v4
-      with:
-        repository: ${{ inputs.repository }}
-        ref: ${{ inputs.ref }}
-        token: ${{ inputs.token }}
-        ssh-key: ${{ inputs.ssh-key }}
-        ssh-known-hosts: ${{ inputs.ssh-known-hosts }}
-        ssh-strict: ${{ inputs.ssh-strict }}
-        ssh-user: ${{ inputs.ssh-user }}
-        persist-credentials: ${{ inputs.persist-credentials }}
-        path: ${{ inputs.path }}
-        clean: ${{ inputs.clean }}
-        filter: ${{ inputs.filter }}
-        sparse-checkout: ${{ inputs.sparse-checkout }}
-        sparse-checkout-cone-mode: ${{ inputs.sparse-checkout-cone-mode }}
-        fetch-depth: ${{ inputs.fetch-depth }}
-        fetch-tags: ${{ inputs.fetch-tags }}
-        show-progress: ${{ inputs.show-progress }}
-        lfs: ${{ inputs.lfs }}
-        submodules: ${{ inputs.submodules }}
-        set-safe-directory: ${{ inputs.set-safe-directory }}
-        github-server-url: ${{ inputs.github-server-url }}
+      shell: bash
+      env:
+        REPO: ${{ inputs.repository }}
+        REF: ${{ inputs.ref || github.ref }}
+        TOKEN: ${{ inputs.token }}
+        SSH_KEY: ${{ inputs.ssh-key }}
+        FETCH_DEPTH: ${{ inputs.fetch-depth }}
+        WORKSPACE: ${{ inputs.path && format('{0}/{1}', github.workspace, inputs.path) || github.workspace }}
+        MIRROR_PATH: /tmp/git-mirror
+        REFRESH_CACHE: ${{ inputs.refresh-cache }}
+        USE_MIRROR: ${{ steps.detect.outputs.is-blacksmith == 'true' && steps.stickydisk.outcome == 'success' }}
+        CLEAN: ${{ inputs.clean }}
+      run: |
+        set -euo pipefail
+
+        # === Debug helper ===
+        debug_mirror_stats() {
+          local label="$1"
+          if [ "${RUNNER_DEBUG:-}" = "1" ] && [ -d "$MIRROR_PATH/objects" ]; then
+            echo "::debug::Mirror size ($label): $(du -sh "$MIRROR_PATH" 2>/dev/null | cut -f1 || echo "unknown")"
+            echo "::debug::Mirror objects ($label): $(git -C "$MIRROR_PATH" count-objects -v | grep in-pack | awk '{print $2}')"
+          fi
+        }
+
+        # === Debug: show mirror stats at start ===
+        [ "$USE_MIRROR" = "true" ] && debug_mirror_stats "before"
+
+        # === Setup auth (from actions/checkout) ===
+        if [ -n "$SSH_KEY" ]; then
+          # SSH auth
+          SSH_KEY_PATH="$RUNNER_TEMP/ssh_key_$$"
+          echo "$SSH_KEY" > "$SSH_KEY_PATH"
+          chmod 600 "$SSH_KEY_PATH"
+
+          KNOWN_HOSTS_PATH="$RUNNER_TEMP/known_hosts_$$"
+          [ -f ~/.ssh/known_hosts ] && cat ~/.ssh/known_hosts > "$KNOWN_HOSTS_PATH"
+          echo "github.com ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQCj7ndNxQowgcQnjshcLrqPEiiphnt+VTTvDP6mHBL9j1aNUkY4Ue1gvwnGLVlOhGeYrnZaMgRK6+PKCUXaDbC7qtbW8gIkhL7aGCsOr/C56SJMy/BCZfxd1nWzAOxSDPgVsmerOBYfNqltV9/hWCqBywINIR+5dIg6JTJ72pcEpEjcYgXkE2YEFXV1JHnsKgbLWNlhScqb2UmyRkQyytRLtL+38TGxkxCflmO+5Z8CSSNY7GidjMIZ7Q4zMjA2n1nGrlTDkzwDCsw+wqFPGQA179cnfGWOWRVruj16z6XyvxvjJwbz0wQZ75XK5tKSb7FNyeIEs4TT4jk+S4dhPeAUC5y+bDYirYgM4GC7uEnztnZyaVWQ7B381AK4Qdrwt51ZqExKbQpTUNn+EjqoTwvqNj4kqx5QUCI0ThS/YkOxJCXmPUWZbhjpCg56i+2aB6CmK2JGhn57K5mj0MNdBXA4/WnwH6XoPWJzK5Nyu2zB3nAZp+S5hpQs+p1vN1/wsjk=" >> "$KNOWN_HOSTS_PATH"
+
+          export GIT_SSH_COMMAND="ssh -i '$SSH_KEY_PATH' -o StrictHostKeyChecking=yes -o UserKnownHostsFile='$KNOWN_HOSTS_PATH'"
+          REPO_URL="git@github.com:${REPO}.git"
+        else
+          # HTTPS auth with token
+          REPO_URL="https://github.com/${REPO}"
+          AUTH_HEADER="AUTHORIZATION: basic $(echo -n "x-access-token:${TOKEN}" | base64)"
+        fi
+
+        # === Helper function for git with auth ===
+        git_auth() {
+          if [ -n "${AUTH_HEADER:-}" ]; then
+            git -c "http.https://github.com/.extraheader=$AUTH_HEADER" "$@"
+          else
+            git "$@"
+          fi
+        }
+
+        # === Mask credentials in logs ===
+        if [ -n "${TOKEN:-}" ]; then
+          echo "::add-mask::$TOKEN"
+        fi
+
+        # === Ensure mirror exists (only if USE_MIRROR) ===
+        # Mirror is only initialized/updated in refresh mode or when empty
+        # Normal checkouts use mirror as-is for speed (stale objects handled by --reference-if-able)
+        if [ "$USE_MIRROR" = "true" ]; then
+          if [ "$REFRESH_CACHE" = "true" ] || [ ! -d "$MIRROR_PATH/objects" ]; then
+            echo "📦 Initializing mirror cache"
+            rm -rf "$MIRROR_PATH"/* "$MIRROR_PATH"/.[!.]* 2>/dev/null || true
+            git_auth clone --mirror "$REPO_URL" "$MIRROR_PATH" || true
+          else
+            echo "📦 Using existing mirror cache"
+          fi
+          debug_mirror_stats "after"
+        fi
+
+        # === Setup workspace ===
+        mkdir -p "$WORKSPACE"
+        cd "$WORKSPACE"
+
+        # Clean workspace if requested and .git exists
+        if [ -d ".git" ]; then
+          if [ "$CLEAN" = "true" ]; then
+            echo "🧹 Cleaning workspace"
+            git clean -ffdx 2>/dev/null || true
+            git reset --hard 2>/dev/null || true
+          fi
+          rm -rf .git
+        fi
+
+        DEPTH_ARG=""
+        [ "$FETCH_DEPTH" != "0" ] && DEPTH_ARG="--depth $FETCH_DEPTH"
+
+        CHECKOUT_TOTAL_START=$(date +%s)
+        FETCH_METHOD="plain"
+
+        # === Build refspec based on REF type ===
+        SHA_PATTERN='^[0-9a-fA-F]{40}$'
+        if [ -z "$REF" ]; then
+          # No ref specified - determine and fetch default branch only
+          DEFAULT_BRANCH=$(git ls-remote --symref origin HEAD 2>/dev/null | grep "ref:" | sed 's/.*refs\/heads\/\([^[:space:]]*\).*/\1/' || echo "main")
+          REFSPEC="+refs/heads/$DEFAULT_BRANCH:refs/remotes/origin/$DEFAULT_BRANCH"
+          CHECKOUT_REF="-B $DEFAULT_BRANCH refs/remotes/origin/$DEFAULT_BRANCH"
+        elif [[ "$REF" =~ $SHA_PATTERN ]]; then
+          # SHA - fetch it directly
+          REFSPEC="$REF"
+          CHECKOUT_REF="$REF"
+        elif [[ "$REF" == refs/heads/* ]]; then
+          # Branch
+          BRANCH_NAME="${REF#refs/heads/}"
+          REFSPEC="+$REF:refs/remotes/origin/$BRANCH_NAME"
+          CHECKOUT_REF="-B $BRANCH_NAME refs/remotes/origin/$BRANCH_NAME"
+        elif [[ "$REF" == refs/pull/*/head ]] || [[ "$REF" == refs/pull/*/merge ]]; then
+          # PR ref
+          REFSPEC="+$REF:refs/remotes/origin/${REF#refs/}"
+          CHECKOUT_REF="FETCH_HEAD"
+        elif [[ "$REF" == refs/tags/* ]]; then
+          # Tag
+          REFSPEC="+$REF:$REF"
+          CHECKOUT_REF="$REF"
+        elif [[ "$REF" == refs/* ]]; then
+          # Other ref
+          REFSPEC="+$REF:$REF"
+          CHECKOUT_REF="FETCH_HEAD"
+        else
+          # Unqualified - assume branch
+          REFSPEC="+refs/heads/$REF:refs/remotes/origin/$REF"
+          CHECKOUT_REF="-B $REF refs/remotes/origin/$REF"
+        fi
+
+        # === Init ===
+        INIT_START=$(date +%s)
+        echo "🚀 Initializing repository"
+        git init --quiet
+        git remote add origin "$REPO_URL"
+
+        # Persist alternates for subsequent workflow steps (so they can access mirror objects)
+        if [ "$USE_MIRROR" = "true" ] && [ -d "$MIRROR_PATH/objects" ]; then
+          mkdir -p .git/objects/info
+          echo "$MIRROR_PATH/objects" > .git/objects/info/alternates
+        fi
+
+        INIT_END=$(date +%s)
+        echo "Init completed in $((INIT_END - INIT_START))s"
+
+        # === Fetch ===
+        FETCH_START=$(date +%s)
+        # --no-tags: don't fetch tags unless explicitly requested
+        # --no-recurse-submodules: skip submodules
+        # protocol.version=2: more efficient negotiation
+        FETCH_ARGS="--no-tags --no-recurse-submodules"
+        # Show progress only in debug mode
+        [ "${RUNNER_DEBUG:-}" = "1" ] && FETCH_ARGS="$FETCH_ARGS --progress" || FETCH_ARGS="$FETCH_ARGS --quiet"
+
+        if [ "$USE_MIRROR" = "true" ] && [ -d "$MIRROR_PATH/objects" ]; then
+          FETCH_METHOD="cached"
+
+          # Convert refspec for bare repo: refs/remotes/origin/X -> refs/heads/X
+          MIRROR_REFSPEC=$(echo "$REFSPEC" | sed 's|refs/remotes/origin/|refs/heads/|g')
+
+          # Background: fetch full depth to mirror (for future runs)
+          echo "📦 Fetching to mirror (background, full depth): $MIRROR_REFSPEC"
+          git_auth -C "$MIRROR_PATH" -c protocol.version=2 fetch origin $FETCH_ARGS $MIRROR_REFSPEC &
+          MIRROR_FETCH_PID=$!
+
+          # Foreground: workspace fetch (uses alternates file for cached objects)
+          echo "📥 Fetching ${REF:-${DEFAULT_BRANCH:-default}} to workspace"
+          if ! git_auth -c protocol.version=2 fetch origin $FETCH_ARGS --prune $DEPTH_ARG $REFSPEC; then
+            echo "⚠️ Fetch failed"
+            exit 1
+          fi
+        else
+          FETCH_METHOD="plain"
+          echo "📥 Fetching ${REF:-${DEFAULT_BRANCH:-default}} from origin"
+          if ! git_auth -c protocol.version=2 fetch origin $FETCH_ARGS --prune $DEPTH_ARG $REFSPEC; then
+            echo "⚠️ Fetch failed"
+            exit 1
+          fi
+        fi
+        FETCH_END=$(date +%s)
+        echo "Fetch completed in $((FETCH_END - FETCH_START))s (method: $FETCH_METHOD)"
+
+        # === Checkout ===
+        CHECKOUT_START=$(date +%s)
+        echo "🔀 Checking out ${REF:-${DEFAULT_BRANCH:-default}}"
+        CHECKOUT_ARGS="--force"
+        [ "${RUNNER_DEBUG:-}" = "1" ] && CHECKOUT_ARGS="$CHECKOUT_ARGS --progress"
+        if ! git checkout $CHECKOUT_ARGS $CHECKOUT_REF; then
+          echo "⚠️ Checkout failed"
+          exit 1
+        fi
+        CHECKOUT_END=$(date +%s)
+        echo "Checkout completed in $((CHECKOUT_END - CHECKOUT_START))s"
+        echo "::notice::Checkout completed in $((CHECKOUT_END - CHECKOUT_TOTAL_START))s (method: $FETCH_METHOD)"
+
+        # === Persist credentials ===
+        echo "🔑 Persisting credentials"
+        if [ -n "$SSH_KEY" ]; then
+          # For SSH, configure insteadOf to use SSH for github.com
+          git config --local url."git@github.com:".insteadOf "https://github.com/"
+        else
+          # For HTTPS, store the extraheader
+          git config --local "http.https://github.com/.extraheader" "$AUTH_HEADER"
+        fi
+
+        # === Output ===
+        echo "ref=$(git symbolic-ref --short HEAD 2>/dev/null || git rev-parse HEAD)" >> $GITHUB_OUTPUT
+        echo "commit=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
+
+        # === Wait for background mirror fetch ===
+        if [ -n "${MIRROR_FETCH_PID:-}" ]; then
+          echo "⏳ Waiting for background mirror fetch to complete..."
+          wait $MIRROR_FETCH_PID || echo "⚠️ Background mirror fetch failed (non-fatal)"
+          echo "✅ Mirror fetch complete"
+        fi
+
+        # === Cleanup temp SSH files ===
+        rm -f "${SSH_KEY_PATH:-}" "${KNOWN_HOSTS_PATH:-}" 2>/dev/null || true
