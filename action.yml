@@ -182,59 +182,67 @@ runs:
 
         # === Checkout specific ref ===
         if [ -n "$REF" ]; then
-          # Determine ref type
-          SHA_PATTERN='^[0-9a-fA-F]{40}$'
+          # Check if already on correct ref (clone may have checked it out)
+          CURRENT_SHA=$(git rev-parse HEAD 2>/dev/null || true)
+          TARGET_SHA=$(git rev-parse "$REF" 2>/dev/null || true)
 
-          if [[ "$REF" =~ $SHA_PATTERN ]]; then
-            REF_TYPE="sha"
-          elif [[ "$REF" == refs/heads/* ]]; then
-            REF_TYPE="branch"
-            BRANCH_NAME="${REF#refs/heads/}"
-          elif [[ "$REF" == refs/pull/*/head ]] || [[ "$REF" == refs/pull/*/merge ]]; then
-            REF_TYPE="pr"
-          elif [[ "$REF" == refs/tags/* ]]; then
-            REF_TYPE="tag"
-          elif [[ "$REF" == refs/* ]]; then
-            REF_TYPE="ref"
+          if [ -n "$TARGET_SHA" ] && [ "$CURRENT_SHA" = "$TARGET_SHA" ]; then
+            echo "🔀 Already on $REF"
           else
-            REF_TYPE="unqualified"
+            # Determine ref type
+            SHA_PATTERN='^[0-9a-fA-F]{40}$'
+
+            if [[ "$REF" =~ $SHA_PATTERN ]]; then
+              REF_TYPE="sha"
+            elif [[ "$REF" == refs/heads/* ]]; then
+              REF_TYPE="branch"
+              BRANCH_NAME="${REF#refs/heads/}"
+            elif [[ "$REF" == refs/pull/*/head ]] || [[ "$REF" == refs/pull/*/merge ]]; then
+              REF_TYPE="pr"
+            elif [[ "$REF" == refs/tags/* ]]; then
+              REF_TYPE="tag"
+            elif [[ "$REF" == refs/* ]]; then
+              REF_TYPE="ref"
+            else
+              REF_TYPE="unqualified"
+            fi
+
+            echo "🔀 Checking out $REF (type: $REF_TYPE)"
+
+            case "$REF_TYPE" in
+              sha)
+                # Fetch specific commit - may need to deepen for shallow clones
+                if [ "$FETCH_DEPTH" != "0" ]; then
+                  git_auth fetch --depth=1 origin "$REF" 2>/dev/null || git_auth fetch --unshallow origin 2>/dev/null || git_auth fetch origin
+                else
+                  git_auth fetch origin
+                fi
+                git checkout "$REF" --quiet
+                ;;
+              branch)
+                git_auth fetch origin "$REF" $DEPTH_ARG
+                git checkout -B "$BRANCH_NAME" FETCH_HEAD --quiet
+                ;;
+              pr)
+                # PR refs need explicit refspec
+                git_auth fetch origin "+$REF:refs/remotes/origin/${REF#refs/}" $DEPTH_ARG
+                git checkout FETCH_HEAD --quiet
+                ;;
+              tag)
+                git_auth fetch origin "$REF:$REF" --no-tags $DEPTH_ARG
+                git checkout "$REF" --quiet
+                ;;
+              ref)
+                git_auth fetch origin "+$REF:$REF" $DEPTH_ARG
+                git checkout FETCH_HEAD --quiet
+                ;;
+              *)
+                # Unqualified - let git figure it out
+                git_auth fetch origin "$REF" $DEPTH_ARG 2>/dev/null || git_auth fetch origin "refs/heads/$REF" $DEPTH_ARG 2>/dev/null || git_auth fetch origin "refs/tags/$REF" $DEPTH_ARG
+                git checkout "$REF" --quiet 2>/dev/null || git checkout FETCH_HEAD --quiet
+                ;;
+            esac
           fi
-
-          echo "🔀 Checking out $REF (type: $REF_TYPE)"
-
-          case "$REF_TYPE" in
-            sha)
-              # Fetch specific commit - may need to deepen for shallow clones
-              if [ "$FETCH_DEPTH" != "0" ]; then
-                git_auth fetch --depth=1 origin "$REF" 2>/dev/null || git_auth fetch --unshallow origin 2>/dev/null || git_auth fetch origin
-              else
-                git_auth fetch origin
-              fi
-              git checkout "$REF" --quiet
-              ;;
-            branch)
-              git_auth fetch origin "$REF" $DEPTH_ARG
-              git checkout -B "$BRANCH_NAME" FETCH_HEAD --quiet
-              ;;
-            pr)
-              # PR refs need explicit refspec
-              git_auth fetch origin "+$REF:refs/remotes/origin/${REF#refs/}" $DEPTH_ARG
-              git checkout FETCH_HEAD --quiet
-              ;;
-            tag)
-              git_auth fetch origin "$REF:$REF" --no-tags $DEPTH_ARG
-              git checkout "$REF" --quiet
-              ;;
-            ref)
-              git_auth fetch origin "+$REF:$REF" $DEPTH_ARG
-              git checkout FETCH_HEAD --quiet
-              ;;
-            *)
-              # Unqualified - let git figure it out
-              git_auth fetch origin "$REF" $DEPTH_ARG 2>/dev/null || git_auth fetch origin "refs/heads/$REF" $DEPTH_ARG 2>/dev/null || git_auth fetch origin "refs/tags/$REF" $DEPTH_ARG
-              git checkout "$REF" --quiet 2>/dev/null || git checkout FETCH_HEAD --quiet
-              ;;
-          esac
         fi
 
         # === Persist credentials ===
