@@ -152,14 +152,18 @@ runs:
 
         # Try with reference first, fallback to plain clone
         CLONE_SUCCESS=false
+        CLONE_METHOD=""
         VERBOSE_ARG=""
         [ "${RUNNER_DEBUG:-}" = "1" ] && VERBOSE_ARG="--verbose"
+        CLONE_START=$(date +%s)
 
         if [ "$USE_MIRROR" = "true" ] && [ -d "$MIRROR_PATH/objects" ]; then
           echo "🚀 Cloning with reference"
+          # Note: --dissociate is safer (copies objects, immune to cache corruption) but slower.
+          # We skip it for speed; fallback clone handles corrupted cache cases.
           if git_auth clone $DEPTH_ARG $VERBOSE_ARG --reference-if-able "$MIRROR_PATH" "$REPO_URL" .; then
             CLONE_SUCCESS=true
-            echo "✅ Clone with reference succeeded"
+            CLONE_METHOD="reference"
           else
             echo "⚠️ Clone with reference failed, falling back to plain clone"
             rm -rf .git 2>/dev/null || true
@@ -169,7 +173,12 @@ runs:
         if [ "$CLONE_SUCCESS" = "false" ]; then
           echo "📥 Cloning without reference"
           git_auth clone $DEPTH_ARG $VERBOSE_ARG "$REPO_URL" .
+          CLONE_METHOD="plain"
         fi
+
+        CLONE_END=$(date +%s)
+        CLONE_DURATION=$((CLONE_END - CLONE_START))
+        echo "::notice::Clone completed in ${CLONE_DURATION}s (method: $CLONE_METHOD)"
 
         # === Checkout specific ref ===
         if [ -n "$REF" ]; then
