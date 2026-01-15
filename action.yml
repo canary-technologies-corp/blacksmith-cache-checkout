@@ -150,7 +150,7 @@ runs:
         DEPTH_ARG=""
         [ "$FETCH_DEPTH" != "0" ] && DEPTH_ARG="--depth $FETCH_DEPTH"
 
-        FETCH_START=$(date +%s)
+        CHECKOUT_TOTAL_START=$(date +%s)
         FETCH_METHOD="plain"
 
         # === Build refspec based on REF type ===
@@ -192,7 +192,7 @@ runs:
         git init --quiet
         git remote add origin "$REPO_URL"
         INIT_END=$(date +%s)
-        echo "::notice::Init completed in $((INIT_END - INIT_START))s"
+        echo "Init completed in $((INIT_END - INIT_START))s"
 
         # Use mirror as alternate object store if available
         if [ "$USE_MIRROR" = "true" ] && [ -d "$MIRROR_PATH/objects" ]; then
@@ -216,7 +216,7 @@ runs:
           fi
         fi
         FETCH_END=$(date +%s)
-        echo "::notice::Fetch completed in $((FETCH_END - FETCH_START))s (method: $FETCH_METHOD)"
+        echo "Fetch completed in $((FETCH_END - FETCH_START))s (method: $FETCH_METHOD)"
 
         # === Checkout ===
         CHECKOUT_START=$(date +%s)
@@ -230,7 +230,8 @@ runs:
           git checkout --progress --force -B "$DEFAULT_BRANCH" "refs/remotes/origin/$DEFAULT_BRANCH"
         fi
         CHECKOUT_END=$(date +%s)
-        echo "::notice::Checkout completed in $((CHECKOUT_END - CHECKOUT_START))s"
+        echo "Checkout completed in $((CHECKOUT_END - CHECKOUT_START))s"
+        echo "::notice::Checkout completed in $((CHECKOUT_END - CHECKOUT_TOTAL_START))s (method: $FETCH_METHOD)"
 
         # === Persist credentials ===
         echo "🔑 Persisting credentials"
