@@ -200,7 +200,9 @@ runs:
         # --no-tags: don't fetch tags unless explicitly requested
         # --no-recurse-submodules: skip submodules
         # protocol.version=2: more efficient negotiation
-        FETCH_ARGS="--no-tags --no-recurse-submodules --progress"
+        FETCH_ARGS="--no-tags --no-recurse-submodules"
+        # Show progress only in debug mode
+        [ "${RUNNER_DEBUG:-}" = "1" ] && FETCH_ARGS="$FETCH_ARGS --progress" || FETCH_ARGS="$FETCH_ARGS --quiet"
 
         if [ "$USE_MIRROR" = "true" ] && [ -d "$MIRROR_PATH/objects" ]; then
           FETCH_METHOD="cached"
@@ -214,7 +216,7 @@ runs:
           MIRROR_FETCH_PID=$!
 
           # Foreground: workspace fetch with alternates (uses what mirror has)
-          echo "📥 Fetching to workspace (via alternates)"
+          echo "📥 Fetching ${REF:-${DEFAULT_BRANCH:-default}} to workspace"
           export GIT_ALTERNATE_OBJECT_DIRECTORIES="$MIRROR_PATH/objects"
           if ! git_auth -c protocol.version=2 fetch origin $FETCH_ARGS --prune $DEPTH_ARG $REFSPEC; then
             echo "⚠️ Fetch failed"
