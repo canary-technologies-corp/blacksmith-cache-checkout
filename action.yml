@@ -211,12 +211,9 @@ runs:
           echo "📦 Fetching to mirror: $MIRROR_REFSPEC"
           git_auth -C "$MIRROR_PATH" -c protocol.version=2 fetch origin $FETCH_ARGS $DEPTH_ARG $MIRROR_REFSPEC || echo "⚠️ Mirror fetch failed (continuing anyway)"
 
-          # Setup alternates so workspace can use mirror objects
-          mkdir -p .git/objects/info
-          echo "$MIRROR_PATH/objects" > .git/objects/info/alternates
-
-          # Workspace fetch - should be fast since objects are in mirror
+          # Workspace fetch with alternates env var - git looks in mirror for objects
           echo "📥 Fetching to workspace (via alternates)"
+          export GIT_ALTERNATE_OBJECT_DIRECTORIES="$MIRROR_PATH/objects"
           if ! git_auth -c protocol.version=2 fetch origin $FETCH_ARGS --prune $DEPTH_ARG $REFSPEC; then
             echo "⚠️ Fetch failed"
             exit 1
