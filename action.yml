@@ -200,22 +200,34 @@ runs:
         # --no-tags: don't fetch tags unless explicitly requested
         # --no-recurse-submodules: skip submodules
         # protocol.version=2: more efficient negotiation
-        FETCH_ARGS="--no-tags --no-recurse-submodules --progress $DEPTH_ARG"
+        FETCH_ARGS="--no-tags --no-recurse-submodules --progress"
 
-        # If mirror available, use alternates so git reads objects directly from mirror
         if [ "$USE_MIRROR" = "true" ] && [ -d "$MIRROR_PATH/objects" ]; then
           FETCH_METHOD="cached"
-          echo "📦 Setting up alternates to mirror"
+
+          # Fetch to mirror first (gets objects we need)
+          # Convert refspec for bare repo: refs/remotes/origin/X -> refs/heads/X
+          MIRROR_REFSPEC=$(echo "$REFSPEC" | sed 's|refs/remotes/origin/|refs/heads/|g')
+          echo "📦 Fetching to mirror: $MIRROR_REFSPEC"
+          git_auth -C "$MIRROR_PATH" -c protocol.version=2 fetch origin $FETCH_ARGS $MIRROR_REFSPEC 2>/dev/null || true
+
+          # Setup alternates so workspace can use mirror objects
           mkdir -p .git/objects/info
           echo "$MIRROR_PATH/objects" > .git/objects/info/alternates
+
+          # Workspace fetch - should be fast since objects are in mirror
+          echo "📥 Fetching to workspace (via alternates)"
+          if ! git_auth -c protocol.version=2 fetch origin $FETCH_ARGS --prune $DEPTH_ARG $REFSPEC; then
+            echo "⚠️ Fetch failed"
+            exit 1
+          fi
         else
           FETCH_METHOD="plain"
-        fi
-
-        echo "📥 Fetching ${REF:-${DEFAULT_BRANCH:-default}} from origin"
-        if ! git_auth -c protocol.version=2 fetch origin $FETCH_ARGS --prune $REFSPEC; then
-          echo "⚠️ Fetch failed"
-          exit 1
+          echo "📥 Fetching ${REF:-${DEFAULT_BRANCH:-default}} from origin"
+          if ! git_auth -c protocol.version=2 fetch origin $FETCH_ARGS --prune $DEPTH_ARG $REFSPEC; then
+            echo "⚠️ Fetch failed"
+            exit 1
+          fi
         fi
         FETCH_END=$(date +%s)
         echo "Fetch completed in $((FETCH_END - FETCH_START))s (method: $FETCH_METHOD)"
