@@ -195,28 +195,30 @@ runs:
         INIT_END=$(date +%s)
         echo "Init completed in $((INIT_END - INIT_START))s"
 
-        # Use mirror as alternate object store if available
-        if [ "$USE_MIRROR" = "true" ] && [ -d "$MIRROR_PATH/objects" ]; then
-          export GIT_ALTERNATE_OBJECT_DIRECTORIES="$MIRROR_PATH/objects"
-          FETCH_METHOD="cached"
-          echo "📦 Using mirror as alternate object store"
-        fi
-
         # === Fetch ===
         FETCH_START=$(date +%s)
-        echo "📥 Fetching $REF"
         # --no-tags: don't fetch tags unless explicitly requested
         # --no-recurse-submodules: skip submodules
         # protocol.version=2: more efficient negotiation
-        FETCH_ARGS="-c protocol.version=2 fetch origin --no-tags --prune --no-recurse-submodules --progress $DEPTH_ARG $REFSPEC"
-        if ! git_auth $FETCH_ARGS; then
-          # Fallback: unset alternates and retry
-          if [ "$FETCH_METHOD" = "cached" ]; then
-            echo "⚠️ Fetch with cache failed, retrying without"
-            unset GIT_ALTERNATE_OBJECT_DIRECTORIES
-            FETCH_METHOD="plain"
-            git_auth $FETCH_ARGS
-          else
+        FETCH_ARGS="--no-tags --no-recurse-submodules --progress $DEPTH_ARG"
+
+        # If mirror available, fetch from it first (local, fast), then fetch only new objects from origin
+        if [ "$USE_MIRROR" = "true" ] && [ -d "$MIRROR_PATH/objects" ]; then
+          FETCH_METHOD="cached"
+          echo "📦 Fetching from local mirror first"
+          git remote add mirror "$MIRROR_PATH" 2>/dev/null || true
+          # Fetch from mirror (local, no network) - ignore errors if ref doesn't exist in mirror
+          git fetch mirror $FETCH_ARGS $REFSPEC 2>/dev/null || true
+
+          echo "📥 Fetching new objects from origin"
+          if ! git_auth -c protocol.version=2 fetch origin $FETCH_ARGS --prune $REFSPEC; then
+            echo "⚠️ Fetch failed"
+            exit 1
+          fi
+        else
+          FETCH_METHOD="plain"
+          echo "📥 Fetching from origin"
+          if ! git_auth -c protocol.version=2 fetch origin $FETCH_ARGS --prune $REFSPEC; then
             exit 1
           fi
         fi
