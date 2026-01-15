@@ -202,25 +202,25 @@ runs:
         # protocol.version=2: more efficient negotiation
         FETCH_ARGS="--no-tags --no-recurse-submodules --progress $DEPTH_ARG"
 
-        # If mirror available, fetch from it first (local, fast), then fetch only new objects from origin
+        # If mirror available, copy objects locally first (faster than network fetch)
         if [ "$USE_MIRROR" = "true" ] && [ -d "$MIRROR_PATH/objects" ]; then
           FETCH_METHOD="cached"
-          echo "📦 Fetching from local mirror first"
-          git remote add mirror "$MIRROR_PATH" 2>/dev/null || true
-          # Fetch from mirror (local, no network) - ignore errors if ref doesn't exist in mirror
-          git fetch mirror $FETCH_ARGS $REFSPEC 2>/dev/null || true
-
-          echo "📥 Fetching new objects from origin"
-          if ! git_auth -c protocol.version=2 fetch origin $FETCH_ARGS --prune $REFSPEC; then
-            echo "⚠️ Fetch failed"
-            exit 1
-          fi
+          echo "📦 Copying objects from mirror cache"
+          COPY_START=$(date +%s)
+          # Copy objects (pack files contain most data)
+          cp -r "$MIRROR_PATH/objects/"* .git/objects/ 2>/dev/null || true
+          # Copy packed-refs if exists
+          [ -f "$MIRROR_PATH/packed-refs" ] && cp "$MIRROR_PATH/packed-refs" .git/ 2>/dev/null || true
+          COPY_END=$(date +%s)
+          echo "Copy completed in $((COPY_END - COPY_START))s"
         else
           FETCH_METHOD="plain"
-          echo "📥 Fetching from origin"
-          if ! git_auth -c protocol.version=2 fetch origin $FETCH_ARGS --prune $REFSPEC; then
-            exit 1
-          fi
+        fi
+
+        echo "📥 Fetching ${REF:-${DEFAULT_BRANCH:-default}} from origin"
+        if ! git_auth -c protocol.version=2 fetch origin $FETCH_ARGS --prune $REFSPEC; then
+          echo "⚠️ Fetch failed"
+          exit 1
         fi
         FETCH_END=$(date +%s)
         echo "Fetch completed in $((FETCH_END - FETCH_START))s (method: $FETCH_METHOD)"
