@@ -209,7 +209,7 @@ runs:
           # Convert refspec for bare repo: refs/remotes/origin/X -> refs/heads/X
           MIRROR_REFSPEC=$(echo "$REFSPEC" | sed 's|refs/remotes/origin/|refs/heads/|g')
           echo "📦 Fetching to mirror: $MIRROR_REFSPEC"
-          git_auth -C "$MIRROR_PATH" -c protocol.version=2 fetch origin $FETCH_ARGS $MIRROR_REFSPEC 2>/dev/null || true
+          git_auth -C "$MIRROR_PATH" -c protocol.version=2 fetch origin $FETCH_ARGS $DEPTH_ARG $MIRROR_REFSPEC 2>/dev/null || true
 
           # Setup alternates so workspace can use mirror objects
           mkdir -p .git/objects/info
