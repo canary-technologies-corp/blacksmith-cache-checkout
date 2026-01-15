@@ -207,10 +207,12 @@ runs:
           FETCH_METHOD="cached"
           echo "📦 Copying objects from mirror cache"
           COPY_START=$(date +%s)
-          # Copy objects (pack files contain most data)
-          cp -r "$MIRROR_PATH/objects/"* .git/objects/ 2>/dev/null || true
-          # Copy packed-refs if exists
-          [ -f "$MIRROR_PATH/packed-refs" ] && cp "$MIRROR_PATH/packed-refs" .git/ 2>/dev/null || true
+          # Try hardlink first (instant, same filesystem), fallback to copy
+          if cp -al "$MIRROR_PATH/objects/"* .git/objects/ 2>/dev/null; then
+            echo "Using hardlinks"
+          else
+            cp -r "$MIRROR_PATH/objects/"* .git/objects/ 2>/dev/null || true
+          fi
           COPY_END=$(date +%s)
           echo "Copy completed in $((COPY_END - COPY_START))s"
         else
