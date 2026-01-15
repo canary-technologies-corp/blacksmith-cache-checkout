@@ -123,19 +123,13 @@ runs:
         # Mirror is only initialized/updated in refresh mode or when empty
         # Normal checkouts use mirror as-is for speed (stale objects handled by --reference-if-able)
         if [ "$USE_MIRROR" = "true" ]; then
-          if [ ! -d "$MIRROR_PATH/objects" ] || [ "$REFRESH_CACHE" = "true" ]; then
-            if [ "$REFRESH_CACHE" = "true" ] && [ -d "$MIRROR_PATH/objects" ]; then
-              echo "🔄 Refresh mode: updating mirror cache"
-              if ! git_auth -C "$MIRROR_PATH" fetch --all --prune --prune-tags 2>/dev/null; then
-                echo "⚠️ Mirror fetch failed, re-cloning from scratch"
-                rm -rf "$MIRROR_PATH"/* "$MIRROR_PATH"/.[!.]* 2>/dev/null || true
-                git_auth clone --mirror "$REPO_URL" "$MIRROR_PATH" || true
-              fi
-            else
-              echo "📦 Initializing mirror cache"
-              # Full mirror (no --filter) so blobs are available for --reference clones
-              git_auth clone --mirror "$REPO_URL" "$MIRROR_PATH" || true
-            fi
+          if [ "$REFRESH_CACHE" = "true" ]; then
+            echo "🔄 Refresh mode: clearing and re-cloning mirror"
+            rm -rf "$MIRROR_PATH"/* "$MIRROR_PATH"/.[!.]* 2>/dev/null || true
+            git_auth clone --mirror "$REPO_URL" "$MIRROR_PATH" || true
+          elif [ ! -d "$MIRROR_PATH/objects" ]; then
+            echo "📦 Initializing mirror cache"
+            git_auth clone --mirror "$REPO_URL" "$MIRROR_PATH" || true
           else
             echo "📦 Using existing mirror cache"
           fi
