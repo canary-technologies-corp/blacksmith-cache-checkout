@@ -202,19 +202,12 @@ runs:
         # protocol.version=2: more efficient negotiation
         FETCH_ARGS="--no-tags --no-recurse-submodules --progress $DEPTH_ARG"
 
-        # If mirror available, copy objects locally first (faster than network fetch)
+        # If mirror available, use alternates so git reads objects directly from mirror
         if [ "$USE_MIRROR" = "true" ] && [ -d "$MIRROR_PATH/objects" ]; then
           FETCH_METHOD="cached"
-          echo "📦 Copying objects from mirror cache"
-          COPY_START=$(date +%s)
-          # Try hardlink first (instant, same filesystem), fallback to copy
-          if cp -al "$MIRROR_PATH/objects/"* .git/objects/ 2>/dev/null; then
-            echo "Using hardlinks"
-          else
-            cp -r "$MIRROR_PATH/objects/"* .git/objects/ 2>/dev/null || true
-          fi
-          COPY_END=$(date +%s)
-          echo "Copy completed in $((COPY_END - COPY_START))s"
+          echo "📦 Setting up alternates to mirror"
+          mkdir -p .git/objects/info
+          echo "$MIRROR_PATH/objects" > .git/objects/info/alternates
         else
           FETCH_METHOD="plain"
         fi
