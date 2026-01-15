@@ -237,8 +237,11 @@ runs:
         CHECKOUT_START=$(date +%s)
         echo "🔀 Checking out ${REF:-${DEFAULT_BRANCH:-default}}"
         CHECKOUT_ARGS="--force"
-        [ "${RUNNER_DEBUG:-}" = "1" ] && CHECKOUT_ARGS="$CHECKOUT_ARGS --progress" || CHECKOUT_ARGS="$CHECKOUT_ARGS --quiet"
-        git checkout $CHECKOUT_ARGS $CHECKOUT_REF
+        [ "${RUNNER_DEBUG:-}" = "1" ] && CHECKOUT_ARGS="$CHECKOUT_ARGS --progress"
+        if ! git checkout $CHECKOUT_ARGS $CHECKOUT_REF; then
+          echo "⚠️ Checkout failed"
+          exit 1
+        fi
         CHECKOUT_END=$(date +%s)
         echo "Checkout completed in $((CHECKOUT_END - CHECKOUT_START))s"
         echo "::notice::Checkout completed in $((CHECKOUT_END - CHECKOUT_TOTAL_START))s (method: $FETCH_METHOD)"
