@@ -62,7 +62,7 @@ runs:
       shell: bash
       env:
         REPO: ${{ inputs.repository }}
-        REF: ${{ inputs.ref || github.ref }}
+        REF: ${{ inputs.ref || (inputs.repository == github.repository && github.ref) || '' }}
         TOKEN: ${{ inputs.token }}
         SSH_KEY: ${{ inputs.ssh-key }}
         FETCH_DEPTH: ${{ inputs.fetch-depth }}
@@ -157,7 +157,7 @@ runs:
         SHA_PATTERN='^[0-9a-fA-F]{40}$'
         if [ -z "$REF" ]; then
           # No ref specified - determine and fetch default branch only
-          DEFAULT_BRANCH=$(git ls-remote --symref origin HEAD 2>/dev/null | grep "ref:" | sed 's/.*refs\/heads\/\([^[:space:]]*\).*/\1/' || echo "main")
+          DEFAULT_BRANCH=$(git_auth ls-remote --symref "$REPO_URL" HEAD 2>/dev/null | grep "ref:" | sed 's/.*refs\/heads\/\([^[:space:]]*\).*/\1/' || echo "main")
           REFSPEC="+refs/heads/$DEFAULT_BRANCH:refs/remotes/origin/$DEFAULT_BRANCH"
           CHECKOUT_REF="-B $DEFAULT_BRANCH refs/remotes/origin/$DEFAULT_BRANCH"
         elif [[ "$REF" =~ $SHA_PATTERN ]]; then
