@@ -63,6 +63,9 @@ runs:
       env:
         REPO: ${{ inputs.repository }}
         REF: ${{ inputs.ref || (inputs.repository == github.repository && github.ref) || '' }}
+        # Pin to specific SHA when using default ref for workflow repository (matches actions/checkout behavior)
+        # This ensures all jobs in a workflow get the same code, even if refs/pull/N/merge updates mid-workflow
+        WORKFLOW_SHA: ${{ !inputs.ref && inputs.repository == github.repository && github.sha || '' }}
         TOKEN: ${{ inputs.token }}
         SSH_KEY: ${{ inputs.ssh-key }}
         FETCH_DEPTH: ${{ inputs.fetch-depth }}
@@ -170,8 +173,13 @@ runs:
           REFSPEC="+$REF:refs/remotes/origin/$BRANCH_NAME"
           CHECKOUT_REF="-B $BRANCH_NAME refs/remotes/origin/$BRANCH_NAME"
         elif [[ "$REF" == refs/pull/*/head ]] || [[ "$REF" == refs/pull/*/merge ]]; then
-          # PR ref
-          REFSPEC="+$REF:refs/remotes/origin/${REF#refs/}"
+          # PR ref - use WORKFLOW_SHA if available to pin to exact merge commit
+          # This prevents issues when refs/pull/N/merge updates between jobs in the same workflow
+          if [ -n "$WORKFLOW_SHA" ]; then
+            REFSPEC="+$WORKFLOW_SHA:refs/remotes/origin/${REF#refs/}"
+          else
+            REFSPEC="+$REF:refs/remotes/origin/${REF#refs/}"
+          fi
           CHECKOUT_REF="FETCH_HEAD"
         elif [[ "$REF" == refs/tags/* ]]; then
           # Tag
