@@ -36,7 +36,7 @@
     "@buf/blacksmith_vm-agent.bufbuild_es": "1.9.0-20260115212136-f78b3d5805ba.2",
     "@buf/blacksmith_vm-agent.connectrpc_es": "1.6.1-20260115212136-f78b3d5805ba.2",
     "@bufbuild/protobuf": "^1.9.0",
-    "@connectrpc/connect": "^1.6.1",
+    "@connectrpc/connect": "^2.1.1",
     "@connectrpc/connect-node": "^1.6.1",
     "uuid": "^9.0.1"
   },
