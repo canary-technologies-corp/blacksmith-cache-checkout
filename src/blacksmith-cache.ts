@@ -11,7 +11,7 @@ const GRPC_PORT = process.env.BLACKSMITH_STICKY_DISK_GRPC_PORT || '5557'
 const MOUNT_BASE = '/blacksmith-git-mirror'
 const MIRROR_VERSION = 'v1'
 
-const REFRESH_TIMEOUT_SECS = 120 // 2 minutes
+const REFRESH_TIMEOUT_SECS = 90 // 90 seconds, single attempt
 const GC_TIMEOUT_SECS = 120 // 2 minutes
 const FLUSH_TIMEOUT_SECS = 10 // 10 seconds for durability flush
 const UMOUNT_TIMEOUT_SECS = 10 // 10 seconds for unmount
@@ -117,15 +117,20 @@ function createBlacksmithClient() {
 /**
  * Format the block device with ext4 if not already formatted
  */
-async function maybeFormatDevice(device: string): Promise<void> {
-  // Check if already formatted
+async function maybeFormatDevice(
+  device: string,
+  signal?: AbortSignal
+): Promise<void> {
+  signal?.throwIfAborted()
+
   const result = await exec.getExecOutput('sudo', ['blkid', device], {
     ignoreReturnCode: true
   })
 
+  signal?.throwIfAborted()
+
   if (result.exitCode === 0 && result.stdout.includes('TYPE=')) {
     core.debug(`Device ${device} is already formatted`)
-    // Resize to use full block device
     try {
       await exec.exec('sudo', ['resize2fs', '-f', device])
       core.debug(`Resized filesystem on ${device}`)
@@ -154,7 +159,8 @@ async function maybeFormatDevice(device: string): Promise<void> {
  */
 export async function setupCache(
   owner: string,
-  repo: string
+  repo: string,
+  signal?: AbortSignal
 ): Promise<CacheInfo> {
   const client = createBlacksmithClient()
   const stickyDiskKey = `${owner}-${repo}`
@@ -162,7 +168,7 @@ export async function setupCache(
   // Test connection
   core.info(`[git-mirror] Connecting to Blacksmith agent for ${stickyDiskKey}`)
   try {
-    await client.up({})
+    await client.up({}, {signal})
     core.debug('[git-mirror] Successfully connected to Blacksmith agent')
   } catch (error) {
     throw new Error(`gRPC connection test failed: ${(error as Error).message}`)
@@ -184,7 +190,7 @@ export async function setupCache(
       vmId: process.env.BLACKSMITH_VM_ID || '',
       repoName: repoName,
       stickyDiskToken: process.env.BLACKSMITH_STICKYDISK_TOKEN || ''
-    })
+    }, {signal})
   } catch (error) {
     // Check if this is a gRPC Aborted error indicating hydration in progress
     if (error instanceof ConnectError && error.code === Code.Aborted) {
@@ -227,8 +233,10 @@ export async function setupCache(
     `[git-mirror] Got sticky disk device: ${device}, exposeId: ${exposeId}`
   )
 
-  // Format if needed
-  await maybeFormatDevice(device)
+  // Format if needed — checks signal before mkfs.ext4
+  await maybeFormatDevice(device, signal)
+
+  signal?.throwIfAborted()
 
   // Mount the device at a unique path for this repository
   const mountPoint = getMountPoint(owner, repo)
@@ -389,54 +397,52 @@ export async function refreshMirror(
   }
 
   core.info(
-    `[git-mirror] Refreshing mirror at ${mirrorPath} (timeout: ${timeoutSecs}s per attempt)`
+    `[git-mirror] Refreshing mirror at ${mirrorPath} (timeout: ${timeoutSecs}s)`
   )
 
   try {
     const {configKey, configValue} = getAuthConfigArgs(repoUrl, authToken)
     const gitEnv = buildGitEnv(verbose)
-    await retryHelper.execute(async () => {
-      // gc.auto=0: disable git's internal auto-gc that porcelain commands like
-      // fetch run after completing. Without this, fetch can spawn a background
-      // gc daemon (gc.autoDetach defaults to true) that holds cwd + mmap'd pack
-      // files on the mirror mount, causing the subsequent umount to fail with
-      // EBUSY. We run gc explicitly in runMirrorGC() with gc.autoDetach=false.
-      const fetchArgs = [
-        '-c',
-        `${configKey}=${configValue}`,
-        '-c',
-        'gc.auto=0',
-        '-C',
-        mirrorPath,
-        'fetch',
-        '--prune',
-        'origin'
-      ]
-      if (verbose) {
-        fetchArgs.splice(
-          fetchArgs.indexOf('origin'),
-          0,
-          '--progress',
-          '--verbose'
-        )
-      }
-      const result = await exec.getExecOutput(
-        'timeout',
-        [String(timeoutSecs), 'git', ...fetchArgs],
-        {env: gitEnv, ignoreReturnCode: true, silent: !verbose}
+    // gc.auto=0: disable git's internal auto-gc that porcelain commands like
+    // fetch run after completing. Without this, fetch can spawn a background
+    // gc daemon (gc.autoDetach defaults to true) that holds cwd + mmap'd pack
+    // files on the mirror mount, causing the subsequent umount to fail with
+    // EBUSY. We run gc explicitly in runMirrorGC() with gc.autoDetach=false.
+    const fetchArgs = [
+      '-c',
+      `${configKey}=${configValue}`,
+      '-c',
+      'gc.auto=0',
+      '-C',
+      mirrorPath,
+      'fetch',
+      '--prune',
+      'origin'
+    ]
+    if (verbose) {
+      fetchArgs.splice(
+        fetchArgs.indexOf('origin'),
+        0,
+        '--progress',
+        '--verbose'
       )
-      if (result.exitCode === TIMEOUT_EXIT_CODE) {
-        throw new Error(`git fetch timed out after ${timeoutSecs}s`)
-      }
-      if (result.exitCode !== 0) {
-        // Include stderr in error message so failure details are visible even when silent
-        const stderr = result.stderr.trim()
-        const details = stderr ? `: ${stderr}` : ''
-        throw new Error(
-          `git fetch failed with exit code ${result.exitCode}${details}`
-        )
-      }
-    })
+    }
+    const result = await exec.getExecOutput(
+      'timeout',
+      [String(timeoutSecs), 'git', ...fetchArgs],
+      {env: gitEnv, ignoreReturnCode: true, silent: !verbose}
+    )
+    if (result.exitCode === TIMEOUT_EXIT_CODE) {
+      throw new Error(`git fetch timed out after ${timeoutSecs}s`)
+    }
+    if (result.exitCode !== 0) {
+      // Include stderr in error message so failure details are visible even when silent
+      const stderr = result.stderr.trim()
+      const details = stderr ? `: ${stderr}` : ''
+      throw new Error(
+        `git fetch failed with exit code ${result.exitCode}${details}`
+      )
+    }
     core.info('[git-mirror] Mirror refresh complete')
     return {success: true, timedOut: false}
   } catch (error) {
