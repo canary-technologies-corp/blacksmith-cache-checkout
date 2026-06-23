@@ -62,11 +62,21 @@ async function cleanup(): Promise<void> {
       // Re-read auth token from input (don't store sensitive data in state)
       const authToken = core.getInput('token', {required: false})
       if (authToken) {
+        // Configurable so a dedicated warming job can give the fetch enough
+        // time on large repos; default keeps upkeep from blocking CI.
+        let refreshTimeoutSecs = parseInt(
+          core.getInput('refresh-timeout-seconds') || '90',
+          10
+        )
+        if (isNaN(refreshTimeoutSecs) || refreshTimeoutSecs <= 0) {
+          refreshTimeoutSecs = 90
+        }
         refreshResult = await blacksmithCache.refreshMirror(
           mirrorPath,
           repoUrl,
           authToken,
-          verbose
+          verbose,
+          refreshTimeoutSecs
         )
       } else {
         core.warning(

@@ -3079,7 +3079,13 @@ function cleanup() {
                 // Re-read auth token from input (don't store sensitive data in state)
                 const authToken = core.getInput('token', { required: false });
                 if (authToken) {
-                    refreshResult = yield blacksmithCache.refreshMirror(mirrorPath, repoUrl, authToken, verbose);
+                    // Configurable so a dedicated warming job can give the fetch enough
+                    // time on large repos; default keeps upkeep from blocking CI.
+                    let refreshTimeoutSecs = parseInt(core.getInput('refresh-timeout-seconds') || '90', 10);
+                    if (isNaN(refreshTimeoutSecs) || refreshTimeoutSecs <= 0) {
+                        refreshTimeoutSecs = 90;
+                    }
+                    refreshResult = yield blacksmithCache.refreshMirror(mirrorPath, repoUrl, authToken, verbose, refreshTimeoutSecs);
                 }
                 else {
                     core.warning('[git-mirror] No auth token available, skipping mirror refresh');
