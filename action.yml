@@ -113,6 +113,12 @@ inputs:
       Timeout in seconds for the sticky disk setup (gRPC + mount). If exceeded, falls back
       to standard checkout. Set to 0 to disable the timeout.
     default: '180'
+  refresh-timeout-seconds:
+    description: >
+      Timeout in seconds for the post-step git mirror refresh fetch. Raise this for a
+      dedicated cache-warming job on large repos; the default keeps best-effort upkeep
+      from blocking CI.
+    default: '90'
 outputs:
   ref:
     description: 'The branch, tag or SHA that was checked out'
