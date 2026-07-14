@@ -4,7 +4,7 @@ import * as fs from 'fs'
 import * as path from 'path'
 import {createClient, ConnectError, Code} from '@connectrpc/connect'
 import {createGrpcTransport} from '@connectrpc/connect-node'
-import {StickyDiskService} from '@buf/blacksmith_vm-agent.connectrpc_es/stickydisk/v1/stickydisk_connect'
+import {StickyDiskService} from './stickydisk-proto'
 import * as retryHelper from './retry-helper'
 
 const GRPC_PORT = process.env.BLACKSMITH_STICKY_DISK_GRPC_PORT || '5557'
@@ -72,6 +72,18 @@ export function isBlacksmithEnvironment(): boolean {
 }
 
 /**
+ * Check if running against a self-hosted roost agent (SRE-930).
+ * ARC runner pods inject STICKY_DISK_GRPC_HOST (the node IP) and mount the
+ * agent's expose directory; Blacksmith VMs never set this variable.
+ * Roost serves the same stickydisk gRPC protocol but in broker mode: the
+ * agent formats and mounts the disk itself and returns a path, because the
+ * runner container is unprivileged.
+ */
+export function isRoostEnvironment(): boolean {
+  return !!process.env.STICKY_DISK_GRPC_HOST
+}
+
+/**
  * Control plane short circuit: when an installation has the
  * `bypass_blacksmith_checkout` flag flipped on, the agent exports
  * BLACKSMITH_BYPASS_CHECKOUT=true into the runner environment. We
@@ -80,7 +92,7 @@ export function isBlacksmithEnvironment(): boolean {
  * action then behaves identically to upstream actions/checkout.
  */
 export function shouldUseBlacksmithCache(): boolean {
-  if (!isBlacksmithEnvironment()) {
+  if (!isBlacksmithEnvironment() && !isRoostEnvironment()) {
     return false
   }
   if (process.env.BLACKSMITH_BYPASS_CHECKOUT === 'true') {
@@ -106,8 +118,13 @@ export function getMirrorPath(owner: string, repo: string): string {
  */
 function createBlacksmithClient() {
   core.debug(`Creating Blacksmith agent client with port: ${GRPC_PORT}`)
+  // Blacksmith's VM agent lives at a fixed address; a self-hosted roost
+  // agent is reached via STICKY_DISK_GRPC_HOST (the node IP — IPv6 on ARC
+  // runners, hence the brackets).
+  const host = process.env.STICKY_DISK_GRPC_HOST || '192.168.127.1'
+  const authority = host.includes(':') ? `[${host}]` : host
   const transport = createGrpcTransport({
-    baseUrl: `http://192.168.127.1:${GRPC_PORT}`,
+    baseUrl: `http://${authority}:${GRPC_PORT}`,
     httpVersion: '2'
   })
 
@@ -164,6 +181,7 @@ export async function setupCache(
 ): Promise<CacheInfo> {
   const client = createBlacksmithClient()
   const stickyDiskKey = `${owner}-${repo}`
+  const roost = isRoostEnvironment()
 
   // Test connection
   core.info(`[git-mirror] Connecting to Blacksmith agent for ${stickyDiskKey}`)
@@ -171,7 +189,15 @@ export async function setupCache(
     await client.up({}, {signal})
     core.debug('[git-mirror] Successfully connected to Blacksmith agent')
   } catch (error) {
-    throw new Error(`gRPC connection test failed: ${(error as Error).message}`)
+    // roost agents don't implement Up; an UNIMPLEMENTED reply still proves
+    // the server is reachable.
+    if (error instanceof ConnectError && error.code === Code.Unimplemented) {
+      core.debug('[git-mirror] Agent has no Up RPC (roost); continuing')
+    } else {
+      throw new Error(
+        `gRPC connection test failed: ${(error as Error).message}`
+      )
+    }
   }
 
   core.info(`[git-mirror] Requesting sticky disk for ${stickyDiskKey}`)
@@ -182,15 +208,21 @@ export async function setupCache(
   const repoName = `${owner}/${repo}`
   let response
   try {
-    response = await client.getStickyDisk({
-      stickyDiskKey: stickyDiskKey,
-      stickyDiskType: 'git_mirror',
-      region: process.env.BLACKSMITH_REGION || '',
-      installationModelId: process.env.BLACKSMITH_INSTALLATION_MODEL_ID || '',
-      vmId: process.env.BLACKSMITH_VM_ID || '',
-      repoName: repoName,
-      stickyDiskToken: process.env.BLACKSMITH_STICKYDISK_TOKEN || ''
-    }, {signal})
+    response = await client.getStickyDisk(
+      {
+        stickyDiskKey: stickyDiskKey,
+        // roost broker mode ("mount"): the agent formats and mounts the disk
+        // and returns the path, since the runner container cannot mount block
+        // devices itself.
+        stickyDiskType: roost ? 'mount' : 'git_mirror',
+        region: process.env.BLACKSMITH_REGION || '',
+        installationModelId: process.env.BLACKSMITH_INSTALLATION_MODEL_ID || '',
+        vmId: process.env.BLACKSMITH_VM_ID || '',
+        repoName: repoName,
+        stickyDiskToken: process.env.BLACKSMITH_STICKYDISK_TOKEN || ''
+      },
+      {signal}
+    )
   } catch (error) {
     // Check if this is a gRPC Aborted error indicating hydration in progress
     if (error instanceof ConnectError && error.code === Code.Aborted) {
@@ -232,6 +264,25 @@ export async function setupCache(
   core.info(
     `[git-mirror] Got sticky disk device: ${device}, exposeId: ${exposeId}`
   )
+
+  if (roost) {
+    // Broker mode: disk_identifier is a host path the agent already
+    // formatted and mounted; the pod sees it via HostToContainer mount
+    // propagation. There is no block device to format or mount here.
+    if (!device.startsWith('/') || !fs.existsSync(device)) {
+      throw new Error(`roost expose path not visible in pod: ${device}`)
+    }
+    return {
+      exposeId,
+      stickyDiskKey,
+      repoName,
+      device: '',
+      mountPoint: device,
+      mirrorPath: path.join(device, MIRROR_VERSION, `${owner}-${repo}.git`),
+      hydrationInProgress: false,
+      performedHydration: false
+    }
+  }
 
   // Format if needed — checks signal before mkfs.ext4
   await maybeFormatDevice(device, signal)
@@ -338,11 +389,17 @@ export async function ensureMirror(
   const gitEnv = buildGitEnv(verbose)
 
   const mirrorDir = path.dirname(mirrorPath)
-  await exec.exec('sudo', ['mkdir', '-p', mirrorDir])
-  // Change ownership so git can write to it
-  const uid = process.getuid?.() ?? 1000
-  const gid = process.getgid?.() ?? 1000
-  await exec.exec('sudo', ['chown', '-R', `${uid}:${gid}`, mirrorDir])
+  if (isRoostEnvironment()) {
+    // The roost expose root is world-writable and the ARC runner container
+    // has no sudo; a plain mkdir as the runner user is enough.
+    await fs.promises.mkdir(mirrorDir, {recursive: true})
+  } else {
+    await exec.exec('sudo', ['mkdir', '-p', mirrorDir])
+    // Change ownership so git can write to it
+    const uid = process.getuid?.() ?? 1000
+    const gid = process.getgid?.() ?? 1000
+    await exec.exec('sudo', ['chown', '-R', `${uid}:${gid}`, mirrorDir])
+  }
   await retryHelper.execute(async () => {
     // Clean up any partial clone from a previous failed attempt
     if (fs.existsSync(mirrorPath)) {
@@ -753,9 +810,19 @@ export async function cleanup(options: CleanupOptions): Promise<CleanupResult> {
     core.warning('[git-mirror] Failed to sync filesystem')
   }
 
+  // roost broker mounts belong to the agent: it unmounts, flushes, and
+  // snapshots the disk itself when we send the commit RPC below. The
+  // unprivileged runner container couldn't umount them anyway.
+  const roost = isRoostEnvironment()
+  if (roost && mountPoint) {
+    core.info(
+      '[git-mirror] roost broker mount: the agent unmounts and flushes during commit'
+    )
+  }
+
   // Get device path before unmount for durability flush
   let devicePath: string | null = null
-  if (mountPoint) {
+  if (mountPoint && !roost) {
     try {
       devicePath = await getDeviceFromMount(mountPoint)
       if (devicePath) {
@@ -769,7 +836,7 @@ export async function cleanup(options: CleanupOptions): Promise<CleanupResult> {
   }
 
   // Unmount the sticky disk with retry and backoff
-  if (mountPoint) {
+  if (mountPoint && !roost) {
     let unmountSuccess = false
     let delayMs = UMOUNT_INITIAL_DELAY_MS
 
@@ -868,7 +935,7 @@ export async function cleanup(options: CleanupOptions): Promise<CleanupResult> {
   // before the Ceph RBD snapshot is taken. The device is still mapped even though unmounted.
   if (devicePath) {
     await flushBlockDevice(devicePath)
-  } else if (mountPoint) {
+  } else if (mountPoint && !roost) {
     core.info(
       '[git-mirror] Skipping durability flush: device path not found for mount point'
     )

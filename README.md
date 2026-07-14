@@ -159,6 +159,11 @@ For these use cases, the persistent git mirror enables incremental updates rathe
     # GIT_CURL_VERBOSE for debugging connection and performance issues.
     # Default: false
     verbose: ''
+
+    # Timeout in seconds for the sticky disk setup (gRPC + mount). If exceeded, falls
+    # back to standard checkout. Set to 0 to disable the timeout.
+    # Default: 180
+    cache-timeout-seconds: ''
 ```
 <!-- end usage -->
 

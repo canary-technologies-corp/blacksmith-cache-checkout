@@ -9,13 +9,6 @@ jest.mock('@connectrpc/connect-node', () => ({
   createGrpcTransport: jest.fn()
 }))
 
-jest.mock(
-  '@buf/blacksmith_vm-agent.connectrpc_es/stickydisk/v1/stickydisk_connect',
-  () => ({
-    StickyDiskService: {}
-  })
-)
-
 import * as blacksmithCache from '../src/blacksmith-cache'
 
 describe('blacksmith-cache tests', () => {
@@ -132,6 +125,34 @@ describe('blacksmith-cache tests', () => {
     })
   })
 
+  describe('isRoostEnvironment', () => {
+    const originalEnv = process.env
+
+    beforeEach(() => {
+      jest.resetModules()
+      process.env = {...originalEnv}
+    })
+
+    afterAll(() => {
+      process.env = originalEnv
+    })
+
+    it('returns true when STICKY_DISK_GRPC_HOST is set', () => {
+      process.env['STICKY_DISK_GRPC_HOST'] = 'fd33::1'
+      expect(blacksmithCache.isRoostEnvironment()).toBe(true)
+    })
+
+    it('returns false when STICKY_DISK_GRPC_HOST is not set', () => {
+      delete process.env['STICKY_DISK_GRPC_HOST']
+      expect(blacksmithCache.isRoostEnvironment()).toBe(false)
+    })
+
+    it('returns false when STICKY_DISK_GRPC_HOST is empty string', () => {
+      process.env['STICKY_DISK_GRPC_HOST'] = ''
+      expect(blacksmithCache.isRoostEnvironment()).toBe(false)
+    })
+  })
+
   describe('shouldUseBlacksmithCache', () => {
     const originalEnv = process.env
 
@@ -152,6 +173,21 @@ describe('blacksmith-cache tests', () => {
 
     it('returns false outside of a Blacksmith env regardless of kill switch', () => {
       delete process.env['BLACKSMITH_VM_ID']
+      delete process.env['STICKY_DISK_GRPC_HOST']
+      process.env['BLACKSMITH_BYPASS_CHECKOUT'] = 'true'
+      expect(blacksmithCache.shouldUseBlacksmithCache()).toBe(false)
+    })
+
+    it('returns true in a roost env (STICKY_DISK_GRPC_HOST) without BLACKSMITH_VM_ID', () => {
+      delete process.env['BLACKSMITH_VM_ID']
+      process.env['STICKY_DISK_GRPC_HOST'] = 'fd33::1'
+      delete process.env['BLACKSMITH_BYPASS_CHECKOUT']
+      expect(blacksmithCache.shouldUseBlacksmithCache()).toBe(true)
+    })
+
+    it('honors the kill switch in a roost env', () => {
+      delete process.env['BLACKSMITH_VM_ID']
+      process.env['STICKY_DISK_GRPC_HOST'] = 'fd33::1'
       process.env['BLACKSMITH_BYPASS_CHECKOUT'] = 'true'
       expect(blacksmithCache.shouldUseBlacksmithCache()).toBe(false)
     })

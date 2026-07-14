@@ -1151,6 +1151,7 @@ async function setup(testName: string): Promise<void> {
 
   settings = {
     authToken: 'some auth token',
+    cacheTimeoutSeconds: 0,
     clean: true,
     commit: '',
     filter: undefined,
