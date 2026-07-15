@@ -2,6 +2,7 @@ import * as fs from 'fs'
 import * as exec from '@actions/exec'
 import {RoostBackend} from '../src/stickydisk/roost-backend'
 import {BlacksmithBackend} from '../src/stickydisk/blacksmith-backend'
+import {selectBackend} from '../src/stickydisk/backend'
 import {GetStickyDiskResponse} from '../src/gen/stickydisk/v1/stickydisk_pb'
 
 // Keep the [git-mirror] log lines out of the test output.
@@ -290,5 +291,83 @@ describe('BlacksmithBackend', () => {
       )
       expect(umountCalls).toHaveLength(3)
     })
+  })
+})
+
+describe('selectBackend', () => {
+  const originalProvider = process.env.STICKY_DISK_PROVIDER
+  const originalHost = process.env.STICKY_DISK_GRPC_HOST
+
+  function setEnv(
+    provider: string | undefined,
+    host: string | undefined
+  ): void {
+    if (provider === undefined) {
+      delete process.env.STICKY_DISK_PROVIDER
+    } else {
+      process.env.STICKY_DISK_PROVIDER = provider
+    }
+    if (host === undefined) {
+      delete process.env.STICKY_DISK_GRPC_HOST
+    } else {
+      process.env.STICKY_DISK_GRPC_HOST = host
+    }
+  }
+
+  function restore(name: string, value: string | undefined): void {
+    if (value === undefined) {
+      delete process.env[name]
+    } else {
+      process.env[name] = value
+    }
+  }
+
+  afterEach(() => {
+    restore('STICKY_DISK_PROVIDER', originalProvider)
+    restore('STICKY_DISK_GRPC_HOST', originalHost)
+  })
+
+  // provider flag, host present?, expected backend name
+  const cases: [string | undefined, boolean, string][] = [
+    ['roost', true, 'roost'],
+    ['roost', false, 'blacksmith'], // host-less roost -> Blacksmith fallback
+    ['Roost', true, 'roost'], // case-insensitive
+    ['blacksmith', true, 'blacksmith'],
+    ['blacksmith', false, 'blacksmith'],
+    ['auto', true, 'roost'],
+    ['auto', false, 'blacksmith'],
+    [undefined, true, 'roost'], // unset + host -> auto-detect roost
+    [undefined, false, 'blacksmith'], // unset + no host -> Blacksmith
+    ['bogus', true, 'roost'], // unknown flag -> auto-detect
+    ['bogus', false, 'blacksmith']
+  ]
+
+  it.each(cases)('provider=%s host=%s -> %s', (provider, hasHost, expected) => {
+    setEnv(provider, hasHost ? 'fd33::1' : undefined)
+    expect(selectBackend().name).toBe(expected)
+  })
+
+  it('warns when roost is requested without a host, then falls back', () => {
+    const core = jest.requireMock('@actions/core') as {
+      warning: jest.Mock
+    }
+    core.warning.mockClear()
+    setEnv('roost', undefined)
+    expect(selectBackend().name).toBe('blacksmith')
+    expect(core.warning).toHaveBeenCalledWith(
+      expect.stringContaining('STICKY_DISK_GRPC_HOST is unset')
+    )
+  })
+
+  it('warns on an unknown provider flag, then auto-detects', () => {
+    const core = jest.requireMock('@actions/core') as {
+      warning: jest.Mock
+    }
+    core.warning.mockClear()
+    setEnv('bogus', 'fd33::1')
+    expect(selectBackend().name).toBe('roost')
+    expect(core.warning).toHaveBeenCalledWith(
+      expect.stringContaining('Unknown STICKY_DISK_PROVIDER')
+    )
   })
 })
