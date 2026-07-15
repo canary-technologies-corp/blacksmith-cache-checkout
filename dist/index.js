@@ -57,17 +57,13 @@ const path = __importStar(__nccwpck_require__(1017));
 const connect_1 = __nccwpck_require__(632);
 const connect_node_1 = __nccwpck_require__(1125);
 const stickydisk_connect_1 = __nccwpck_require__(6867);
+const backend_1 = __nccwpck_require__(5103);
 const retryHelper = __importStar(__nccwpck_require__(2155));
 const GRPC_PORT = process.env.BLACKSMITH_STICKY_DISK_GRPC_PORT || '5557';
 const MOUNT_BASE = '/blacksmith-git-mirror';
 const MIRROR_VERSION = 'v1';
 const REFRESH_TIMEOUT_SECS = 90; // 90 seconds, single attempt
 const GC_TIMEOUT_SECS = 120; // 2 minutes
-const FLUSH_TIMEOUT_SECS = 10; // 10 seconds for durability flush
-const UMOUNT_TIMEOUT_SECS = 10; // 10 seconds for unmount
-const UMOUNT_MAX_RETRIES = 3; // Number of unmount retry attempts
-const UMOUNT_INITIAL_DELAY_MS = 1000; // Initial delay between retries (1 second)
-const UMOUNT_BACKOFF_MULTIPLIER = 2; // Exponential backoff multiplier
 // Exit code returned by the `timeout` command when the child is killed.
 const TIMEOUT_EXIT_CODE = 124;
 /**
@@ -123,14 +119,12 @@ function getMirrorPath(owner, repo) {
     return path.join(mountPoint, MIRROR_VERSION, `${owner}-${repo}.git`);
 }
 /**
- * Create a gRPC client for communicating with the Blacksmith VM agent
+ * Create a gRPC client for communicating with the stickydisk agent at `host`.
+ * The host is bare; a self-hosted roost agent's node IP is IPv6 on ARC
+ * runners, hence the brackets.
  */
-function createBlacksmithClient() {
-    core.debug(`Creating Blacksmith agent client with port: ${GRPC_PORT}`);
-    // Blacksmith's VM agent lives at a fixed address; a self-hosted roost
-    // agent is reached via STICKY_DISK_GRPC_HOST (the node IP — IPv6 on ARC
-    // runners, hence the brackets).
-    const host = process.env.STICKY_DISK_GRPC_HOST || '192.168.127.1';
+function createBlacksmithClient(host) {
+    core.debug(`Creating stickydisk agent client at ${host}:${GRPC_PORT}`);
     const authority = host.includes(':') ? `[${host}]` : host;
     const transport = (0, connect_node_1.createGrpcTransport)({
         baseUrl: `http://${authority}:${GRPC_PORT}`,
@@ -139,48 +133,15 @@ function createBlacksmithClient() {
     return (0, connect_1.createClient)(stickydisk_connect_1.StickyDiskService, transport);
 }
 /**
- * Format the block device with ext4 if not already formatted
- */
-function maybeFormatDevice(device, signal) {
-    return __awaiter(this, void 0, void 0, function* () {
-        signal === null || signal === void 0 ? void 0 : signal.throwIfAborted();
-        const result = yield exec.getExecOutput('sudo', ['blkid', device], {
-            ignoreReturnCode: true
-        });
-        signal === null || signal === void 0 ? void 0 : signal.throwIfAborted();
-        if (result.exitCode === 0 && result.stdout.includes('TYPE=')) {
-            core.debug(`Device ${device} is already formatted`);
-            try {
-                yield exec.exec('sudo', ['resize2fs', '-f', device]);
-                core.debug(`Resized filesystem on ${device}`);
-            }
-            catch (_a) {
-                core.warning(`Error resizing filesystem on ${device}`);
-            }
-            return;
-        }
-        // Format with ext4
-        core.info(`Formatting device ${device} with ext4`);
-        yield exec.exec('sudo', [
-            'mkfs.ext4',
-            '-m0',
-            '-Enodiscard,lazy_itable_init=1,lazy_journal_init=1',
-            '-F',
-            device
-        ]);
-        core.debug(`Successfully formatted ${device} with ext4`);
-    });
-}
-/**
  * Request a sticky disk from the VM agent, format if needed, and mount it.
  * Returns CacheInfo with hydrationInProgress=true if another job is hydrating,
  * allowing the caller to fall back to regular checkout.
  */
 function setupCache(owner, repo, signal) {
     return __awaiter(this, void 0, void 0, function* () {
-        const client = createBlacksmithClient();
+        const backend = (0, backend_1.selectBackend)();
+        const client = createBlacksmithClient(backend.host);
         const stickyDiskKey = `${owner}-${repo}`;
-        const roost = isRoostEnvironment();
         // Test connection
         core.info(`[git-mirror] Connecting to Blacksmith agent for ${stickyDiskKey}`);
         try {
@@ -206,10 +167,10 @@ function setupCache(owner, repo, signal) {
         try {
             response = yield client.getStickyDisk({
                 stickyDiskKey: stickyDiskKey,
-                // roost broker mode ("mount"): the agent formats and mounts the disk
-                // and returns the path, since the runner container cannot mount block
-                // devices itself.
-                stickyDiskType: roost ? 'mount' : 'git_mirror',
+                // Blacksmith VMs use native "git_mirror" (a raw block device); roost
+                // broker mode uses "mount" (the agent formats/mounts and returns a
+                // path, since the runner container cannot mount block devices itself).
+                stickyDiskType: backend.stickyDiskType,
                 region: process.env.BLACKSMITH_REGION || '',
                 installationModelId: process.env.BLACKSMITH_INSTALLATION_MODEL_ID || '',
                 vmId: process.env.BLACKSMITH_VM_ID || '',
@@ -227,7 +188,6 @@ function setupCache(owner, repo, signal) {
                     exposeId: '',
                     stickyDiskKey,
                     repoName,
-                    device: '',
                     mountPoint: '',
                     mirrorPath: '',
                     hydrationInProgress: true,
@@ -239,47 +199,26 @@ function setupCache(owner, repo, signal) {
             throw error;
         }
         const exposeId = response.exposeId || '';
-        const device = response.diskIdentifier || '';
-        if (!device) {
+        const diskIdentifier = response.diskIdentifier || '';
+        if (!diskIdentifier) {
             throw new Error('No device found in sticky disk response');
         }
         if (!exposeId) {
             throw new Error('No exposeId found in sticky disk response');
         }
-        core.info(`[git-mirror] Got sticky disk device: ${device}, exposeId: ${exposeId}`);
-        if (roost) {
-            // Broker mode: disk_identifier is a host path the agent already
-            // formatted and mounted; the pod sees it via HostToContainer mount
-            // propagation. There is no block device to format or mount here.
-            if (!device.startsWith('/') || !fs.existsSync(device)) {
-                throw new Error(`roost expose path not visible in pod: ${device}`);
-            }
-            return {
-                exposeId,
-                stickyDiskKey,
-                repoName,
-                device: '',
-                mountPoint: device,
-                mirrorPath: path.join(device, MIRROR_VERSION, `${owner}-${repo}.git`),
-                hydrationInProgress: false,
-                performedHydration: false
-            };
-        }
-        // Format if needed — checks signal before mkfs.ext4
-        yield maybeFormatDevice(device, signal);
-        signal === null || signal === void 0 ? void 0 : signal.throwIfAborted();
-        // Mount the device at a unique path for this repository
-        const mountPoint = getMountPoint(owner, repo);
-        yield exec.exec('sudo', ['mkdir', '-p', mountPoint]);
-        yield exec.exec('sudo', ['mount', device, mountPoint]);
-        core.info(`[git-mirror] Mounted ${device} at ${mountPoint}`);
+        core.info(`[git-mirror] Got sticky disk identifier: ${diskIdentifier}, exposeId: ${exposeId}`);
+        // Delegate provider-specific provisioning. Blacksmith formats the block
+        // device and mounts it at the computed mount target; roost validates the
+        // path the agent already mounted (ignoring the target). Either way we get
+        // the ready mount-point directory back, and the mirror path is derived from
+        // it identically for both providers.
+        const mountPoint = yield backend.provisionMount(response, getMountPoint(owner, repo), signal);
         return {
             exposeId,
             stickyDiskKey,
             repoName,
-            device,
             mountPoint,
-            mirrorPath: getMirrorPath(owner, repo),
+            mirrorPath: path.join(mountPoint, MIRROR_VERSION, `${owner}-${repo}.git`),
             hydrationInProgress: false,
             performedHydration: false // Will be set by ensureMirror if we do initial clone
         };
@@ -338,7 +277,6 @@ function buildGitEnv(verbose) {
  */
 function ensureMirror(mirrorPath_1, repoUrl_1, authToken_1) {
     return __awaiter(this, arguments, void 0, function* (mirrorPath, repoUrl, authToken, verbose = false) {
-        var _a, _b, _c, _d;
         if (fs.existsSync(mirrorPath)) {
             // Mirror exists - skip fetch here, it will be done in the post step
             core.info(`[git-mirror] Found existing mirror at ${mirrorPath}, deferring refresh to post step`);
@@ -349,18 +287,10 @@ function ensureMirror(mirrorPath_1, repoUrl_1, authToken_1) {
         const { configKey, configValue } = getAuthConfigArgs(repoUrl, authToken);
         const gitEnv = buildGitEnv(verbose);
         const mirrorDir = path.dirname(mirrorPath);
-        if (isRoostEnvironment()) {
-            // The roost expose root is world-writable and the ARC runner container
-            // has no sudo; a plain mkdir as the runner user is enough.
-            yield fs.promises.mkdir(mirrorDir, { recursive: true });
-        }
-        else {
-            yield exec.exec('sudo', ['mkdir', '-p', mirrorDir]);
-            // Change ownership so git can write to it
-            const uid = (_b = (_a = process.getuid) === null || _a === void 0 ? void 0 : _a.call(process)) !== null && _b !== void 0 ? _b : 1000;
-            const gid = (_d = (_c = process.getgid) === null || _c === void 0 ? void 0 : _c.call(process)) !== null && _d !== void 0 ? _d : 1000;
-            yield exec.exec('sudo', ['chown', '-R', `${uid}:${gid}`, mirrorDir]);
-        }
+        // Blacksmith needs sudo mkdir + chown (privileged runner); roost uses a plain
+        // mkdir as the runner user (world-writable expose, no sudo). The env is
+        // stable across steps so re-selecting here is deterministic.
+        yield (0, backend_1.selectBackend)().prepareMirrorDir(mirrorDir);
         yield retryHelper.execute(() => __awaiter(this, void 0, void 0, function* () {
             // Clean up any partial clone from a previous failed attempt
             if (fs.existsSync(mirrorPath)) {
@@ -539,101 +469,11 @@ function runMirrorGC(mirrorPath_1) {
     });
 }
 /**
- * Get the block device path for a mount point.
- * Tries findmnt first, then falls back to parsing mount output.
- */
-function getDeviceFromMount(mountPoint) {
-    return __awaiter(this, void 0, void 0, function* () {
-        try {
-            const result = yield exec.getExecOutput('findmnt', ['-n', '-o', 'SOURCE', mountPoint], { ignoreReturnCode: true, silent: true });
-            if (result.exitCode === 0 && result.stdout.trim()) {
-                return result.stdout.trim();
-            }
-        }
-        catch (_a) {
-            core.info(`[git-mirror] findmnt failed for ${mountPoint}, trying mount command`);
-        }
-        try {
-            const result = yield exec.getExecOutput('mount', [], {
-                ignoreReturnCode: true,
-                silent: true
-            });
-            if (result.exitCode === 0) {
-                const lines = result.stdout.split('\n');
-                for (const line of lines) {
-                    if (line.includes(` ${mountPoint} `)) {
-                        const match = line.match(/^(\/dev\/\S+)/);
-                        if (match) {
-                            return match[1];
-                        }
-                    }
-                }
-            }
-        }
-        catch (_b) {
-            core.info(`[git-mirror] mount command failed for ${mountPoint}`);
-        }
-        return null;
-    });
-}
-/**
- * Flush block device buffers to ensure data durability before Ceph RBD snapshot.
- * This is a best-effort operation - failures are logged but don't fail the cleanup.
- */
-function flushBlockDevice(devicePath) {
-    return __awaiter(this, void 0, void 0, function* () {
-        const deviceName = devicePath.replace('/dev/', '');
-        if (!deviceName) {
-            core.info(`[git-mirror] Could not extract device name from ${devicePath}`);
-            return;
-        }
-        const statPath = `/sys/block/${deviceName}/stat`;
-        let beforeStats = '';
-        try {
-            beforeStats = fs.readFileSync(statPath, 'utf8').trim();
-        }
-        catch (_a) {
-            core.info(`[git-mirror] Could not read block device stats before flush: ${statPath}`);
-        }
-        const startTime = Date.now();
-        try {
-            const result = yield exec.getExecOutput('timeout', [
-                String(FLUSH_TIMEOUT_SECS),
-                'sudo',
-                'blockdev',
-                '--flushbufs',
-                devicePath
-            ], { ignoreReturnCode: true });
-            const duration = Date.now() - startTime;
-            if (result.exitCode === TIMEOUT_EXIT_CODE) {
-                core.warning(`[git-mirror] Flush timed out for ${devicePath} after ${FLUSH_TIMEOUT_SECS}s`);
-                return;
-            }
-            if (result.exitCode !== 0) {
-                core.warning(`[git-mirror] Flush failed for ${devicePath} after ${duration}ms: exit code ${result.exitCode}`);
-                return;
-            }
-            let afterStats = '';
-            try {
-                afterStats = fs.readFileSync(statPath, 'utf8').trim();
-            }
-            catch (_b) {
-                core.info(`[git-mirror] Could not read block device stats after flush: ${statPath}`);
-            }
-            core.info(`[git-mirror] guest flush duration: ${duration}ms, device: ${devicePath}, before_stats: ${beforeStats}, after_stats: ${afterStats}`);
-        }
-        catch (error) {
-            const duration = Date.now() - startTime;
-            const msg = error.message || String(error);
-            core.warning(`[git-mirror] Flush failed for ${devicePath} after ${duration}ms: ${msg}`);
-        }
-    });
-}
-/**
  * Cleanup: run GC, sync, unmount, and commit the sticky disk.
  *
- * Execution order: GC → sync → unmount (with retry) → flush → commit
- * If any of mirror refresh / GC fail or time out, shouldCommit is set to false.
+ * Execution order: GC → sync → release mount (backend) → commit
+ * If any of mirror refresh / GC / mount release fail, shouldCommit is set to
+ * false (but the commit RPC is still sent so the agent releases the expose).
  */
 function cleanup(options) {
     return __awaiter(this, void 0, void 0, function* () {
@@ -673,107 +513,28 @@ function cleanup(options) {
         catch (_b) {
             core.warning('[git-mirror] Failed to sync filesystem');
         }
-        // roost broker mounts belong to the agent: it unmounts, flushes, and
-        // snapshots the disk itself when we send the commit RPC below. The
-        // unprivileged runner container couldn't umount them anyway.
-        const roost = isRoostEnvironment();
-        if (roost && mountPoint) {
-            core.info('[git-mirror] roost broker mount: the agent unmounts and flushes during commit');
-        }
-        // Get device path before unmount for durability flush
-        let devicePath = null;
-        if (mountPoint && !roost) {
-            try {
-                devicePath = yield getDeviceFromMount(mountPoint);
-                if (devicePath) {
-                    core.info(`[git-mirror] Found device ${devicePath} for mount point ${mountPoint}`);
-                }
-            }
-            catch (_c) {
-                core.info(`[git-mirror] Could not determine device for ${mountPoint}`);
-            }
-        }
-        // Unmount the sticky disk with retry and backoff
-        if (mountPoint && !roost) {
-            let unmountSuccess = false;
-            let delayMs = UMOUNT_INITIAL_DELAY_MS;
-            for (let attempt = 1; attempt <= UMOUNT_MAX_RETRIES; attempt++) {
-                core.info(`[git-mirror] Unmounting ${mountPoint} (attempt ${attempt}/${UMOUNT_MAX_RETRIES})`);
-                try {
-                    const umountResult = yield exec.getExecOutput('timeout', [String(UMOUNT_TIMEOUT_SECS), 'sudo', 'umount', mountPoint], { ignoreReturnCode: true });
-                    if (umountResult.exitCode === 0) {
-                        unmountSuccess = true;
-                        core.info(`[git-mirror] Successfully unmounted ${mountPoint}`);
-                        break;
-                    }
-                    if (umountResult.exitCode === TIMEOUT_EXIT_CODE) {
-                        core.warning(`[git-mirror] Unmount attempt ${attempt} timed out after ${UMOUNT_TIMEOUT_SECS}s`);
-                    }
-                    else {
-                        core.warning(`[git-mirror] Unmount attempt ${attempt} failed with exit code ${umountResult.exitCode}`);
-                    }
-                    // Print diagnostic info about what's using the mount point (with 5s timeout to avoid hanging)
-                    core.info(`[git-mirror] Checking for processes using ${mountPoint}...`);
-                    try {
-                        const lsofResult = yield exec.getExecOutput('timeout', ['5', 'lsof', '+D', mountPoint], { ignoreReturnCode: true, silent: true });
-                        if (lsofResult.exitCode === TIMEOUT_EXIT_CODE) {
-                            core.info(`[git-mirror] lsof timed out after 5s`);
-                        }
-                        else if (lsofResult.stdout.trim()) {
-                            core.warning(`[git-mirror] Processes using ${mountPoint}:\n${lsofResult.stdout}`);
-                        }
-                        else {
-                            core.info(`[git-mirror] No processes found using ${mountPoint}`);
-                        }
-                    }
-                    catch (_d) {
-                        // lsof may not be available, try fuser as fallback
-                        try {
-                            const fuserResult = yield exec.getExecOutput('timeout', ['5', 'fuser', '-vm', mountPoint], { ignoreReturnCode: true, silent: true });
-                            if (fuserResult.exitCode === TIMEOUT_EXIT_CODE) {
-                                core.info(`[git-mirror] fuser timed out after 5s`);
-                            }
-                            else if (fuserResult.stdout.trim() || fuserResult.stderr.trim()) {
-                                core.warning(`[git-mirror] Processes using ${mountPoint}:\n${fuserResult.stdout}${fuserResult.stderr}`);
-                            }
-                        }
-                        catch (_e) {
-                            core.info(`[git-mirror] Could not determine processes using ${mountPoint}`);
-                        }
-                    }
-                    if (attempt < UMOUNT_MAX_RETRIES) {
-                        core.info(`[git-mirror] Waiting ${delayMs}ms before retry...`);
-                        yield new Promise(resolve => setTimeout(resolve, delayMs));
-                        delayMs *= UMOUNT_BACKOFF_MULTIPLIER;
-                    }
-                }
-                catch (error) {
-                    core.warning(`[git-mirror] Unmount attempt ${attempt} threw error: ${error.message}`);
-                    if (attempt < UMOUNT_MAX_RETRIES) {
-                        core.info(`[git-mirror] Waiting ${delayMs}ms before retry...`);
-                        yield new Promise(resolve => setTimeout(resolve, delayMs));
-                        delayMs *= UMOUNT_BACKOFF_MULTIPLIER;
-                    }
-                }
-            }
-            if (!unmountSuccess) {
-                core.warning(`[git-mirror] Failed to unmount ${mountPoint} after ${UMOUNT_MAX_RETRIES} attempts, will not commit sticky disk`);
+        // Release the mount before committing. cleanup runs in a separate process
+        // from setup, so we re-select the backend from the (stable) environment.
+        // Blacksmith unmounts (with retries) and flushes the block device, reporting
+        // released=false if the unmount ultimately failed; roost is a no-op (its
+        // agent unmounts, flushes, and snapshots the disk itself during the commit
+        // RPC below). Guard on a non-empty mountPoint (the hydration-fallback path
+        // saves none).
+        const backend = (0, backend_1.selectBackend)();
+        if (mountPoint) {
+            const { released } = yield backend.releaseMount(mountPoint);
+            if (!released) {
+                // The unmount ultimately failed: don't snapshot a still-mounted, dirty
+                // filesystem. We still send the commit RPC below (with should_commit
+                // false) so the agent releases the expose without persisting bad state.
                 shouldCommit = false;
                 vmHydratedGitMirror = false;
             }
         }
-        // Flush block device buffers after unmount to ensure data durability
-        // before the Ceph RBD snapshot is taken. The device is still mapped even though unmounted.
-        if (devicePath) {
-            yield flushBlockDevice(devicePath);
-        }
-        else if (mountPoint && !roost) {
-            core.info('[git-mirror] Skipping durability flush: device path not found for mount point');
-        }
         // Commit the sticky disk to persist changes
         core.info(`[git-mirror] Committing sticky disk: shouldCommit=${shouldCommit}, vmHydratedGitMirror=${vmHydratedGitMirror}`);
         try {
-            const client = createBlacksmithClient();
+            const client = createBlacksmithClient(backend.host);
             yield client.commitStickyDisk({
                 exposeId: exposeId,
                 stickyDiskKey: stickyDiskKey,
@@ -4352,6 +4113,475 @@ function hasAnyStepFailed(runnerBasePath) {
         return result.hasFailures;
     });
 }
+
+
+/***/ }),
+
+/***/ 5103:
+/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
+
+"use strict";
+
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || function (mod) {
+    if (mod && mod.__esModule) return mod;
+    var result = {};
+    if (mod != null) for (var k in mod) if (k !== "default" && Object.prototype.hasOwnProperty.call(mod, k)) __createBinding(result, mod, k);
+    __setModuleDefault(result, mod);
+    return result;
+};
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.selectBackend = selectBackend;
+const core = __importStar(__nccwpck_require__(2186));
+const blacksmith_backend_1 = __nccwpck_require__(677);
+const roost_backend_1 = __nccwpck_require__(4689);
+/**
+ * Choose the stickydisk backend for the current run from the environment.
+ *
+ * Precedence (see the design spec):
+ *   1. STICKY_DISK_PROVIDER=roost -> RoostBackend, but only if
+ *      STICKY_DISK_GRPC_HOST is set; otherwise warn and fall back to Blacksmith
+ *      (an empty-host roost backend would dial http://:5557 and burn the whole
+ *      cacheTimeoutSeconds before falling back).
+ *   2. STICKY_DISK_PROVIDER=blacksmith -> BlacksmithBackend.
+ *   3. auto / unset -> RoostBackend if STICKY_DISK_GRPC_HOST is set, else
+ *      BlacksmithBackend.
+ *   4. Any other value -> warn and auto-detect (rule 3). A typo'd flag must not
+ *      fail checkout.
+ *
+ * This runs in both the main and post steps; because it reads only the
+ * environment (stable across both processes) the selection is deterministic.
+ */
+function selectBackend() {
+    var _a;
+    const flag = (_a = process.env.STICKY_DISK_PROVIDER) === null || _a === void 0 ? void 0 : _a.toLowerCase();
+    const hasHost = !!process.env.STICKY_DISK_GRPC_HOST;
+    if (flag === 'blacksmith')
+        return new blacksmith_backend_1.BlacksmithBackend();
+    if (flag === 'roost') {
+        if (!hasHost) {
+            core.warning('[git-mirror] STICKY_DISK_PROVIDER=roost but STICKY_DISK_GRPC_HOST is unset; using Blacksmith');
+            return new blacksmith_backend_1.BlacksmithBackend();
+        }
+        return new roost_backend_1.RoostBackend();
+    }
+    if (flag && flag !== 'auto') {
+        core.warning(`[git-mirror] Unknown STICKY_DISK_PROVIDER "${flag}"; auto-detecting`);
+    }
+    return hasHost ? new roost_backend_1.RoostBackend() : new blacksmith_backend_1.BlacksmithBackend();
+}
+
+
+/***/ }),
+
+/***/ 677:
+/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
+
+"use strict";
+
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || function (mod) {
+    if (mod && mod.__esModule) return mod;
+    var result = {};
+    if (mod != null) for (var k in mod) if (k !== "default" && Object.prototype.hasOwnProperty.call(mod, k)) __createBinding(result, mod, k);
+    __setModuleDefault(result, mod);
+    return result;
+};
+var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, generator) {
+    function adopt(value) { return value instanceof P ? value : new P(function (resolve) { resolve(value); }); }
+    return new (P || (P = Promise))(function (resolve, reject) {
+        function fulfilled(value) { try { step(generator.next(value)); } catch (e) { reject(e); } }
+        function rejected(value) { try { step(generator["throw"](value)); } catch (e) { reject(e); } }
+        function step(result) { result.done ? resolve(result.value) : adopt(result.value).then(fulfilled, rejected); }
+        step((generator = generator.apply(thisArg, _arguments || [])).next());
+    });
+};
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.BlacksmithBackend = void 0;
+const core = __importStar(__nccwpck_require__(2186));
+const exec = __importStar(__nccwpck_require__(1514));
+const fs = __importStar(__nccwpck_require__(7147));
+// Durability flush + unmount tuning (Blacksmith VMs only). Roost never touches
+// the block device, so these live here rather than in the orchestrator.
+const FLUSH_TIMEOUT_SECS = 10; // 10 seconds for durability flush
+const UMOUNT_TIMEOUT_SECS = 10; // 10 seconds for unmount
+const UMOUNT_MAX_RETRIES = 3; // Number of unmount retry attempts
+const UMOUNT_INITIAL_DELAY_MS = 1000; // Initial delay between retries (1 second)
+const UMOUNT_BACKOFF_MULTIPLIER = 2; // Exponential backoff multiplier
+// Exit code returned by the `timeout` command when the child is killed.
+const TIMEOUT_EXIT_CODE = 124;
+/**
+ * Format the block device with ext4 if not already formatted.
+ */
+function maybeFormatDevice(device, signal) {
+    return __awaiter(this, void 0, void 0, function* () {
+        signal === null || signal === void 0 ? void 0 : signal.throwIfAborted();
+        const result = yield exec.getExecOutput('sudo', ['blkid', device], {
+            ignoreReturnCode: true
+        });
+        signal === null || signal === void 0 ? void 0 : signal.throwIfAborted();
+        if (result.exitCode === 0 && result.stdout.includes('TYPE=')) {
+            core.debug(`[git-mirror] Device ${device} is already formatted`);
+            try {
+                yield exec.exec('sudo', ['resize2fs', '-f', device]);
+                core.debug(`[git-mirror] Resized filesystem on ${device}`);
+            }
+            catch (_a) {
+                core.warning(`[git-mirror] Error resizing filesystem on ${device}`);
+            }
+            return;
+        }
+        // Format with ext4
+        core.info(`[git-mirror] Formatting device ${device} with ext4`);
+        yield exec.exec('sudo', [
+            'mkfs.ext4',
+            '-m0',
+            '-Enodiscard,lazy_itable_init=1,lazy_journal_init=1',
+            '-F',
+            device
+        ]);
+        core.debug(`[git-mirror] Successfully formatted ${device} with ext4`);
+    });
+}
+/**
+ * Get the block device path for a mount point.
+ * Tries findmnt first, then falls back to parsing mount output.
+ */
+function getDeviceFromMount(mountPoint) {
+    return __awaiter(this, void 0, void 0, function* () {
+        try {
+            const result = yield exec.getExecOutput('findmnt', ['-n', '-o', 'SOURCE', mountPoint], { ignoreReturnCode: true, silent: true });
+            if (result.exitCode === 0 && result.stdout.trim()) {
+                return result.stdout.trim();
+            }
+        }
+        catch (_a) {
+            core.info(`[git-mirror] findmnt failed for ${mountPoint}, trying mount command`);
+        }
+        try {
+            const result = yield exec.getExecOutput('mount', [], {
+                ignoreReturnCode: true,
+                silent: true
+            });
+            if (result.exitCode === 0) {
+                const lines = result.stdout.split('\n');
+                for (const line of lines) {
+                    if (line.includes(` ${mountPoint} `)) {
+                        const match = line.match(/^(\/dev\/\S+)/);
+                        if (match) {
+                            return match[1];
+                        }
+                    }
+                }
+            }
+        }
+        catch (_b) {
+            core.info(`[git-mirror] mount command failed for ${mountPoint}`);
+        }
+        return null;
+    });
+}
+/**
+ * Flush block device buffers to ensure data durability before Ceph RBD snapshot.
+ * This is a best-effort operation - failures are logged but don't fail the cleanup.
+ */
+function flushBlockDevice(devicePath) {
+    return __awaiter(this, void 0, void 0, function* () {
+        const deviceName = devicePath.replace('/dev/', '');
+        if (!deviceName) {
+            core.info(`[git-mirror] Could not extract device name from ${devicePath}`);
+            return;
+        }
+        const statPath = `/sys/block/${deviceName}/stat`;
+        let beforeStats = '';
+        try {
+            beforeStats = fs.readFileSync(statPath, 'utf8').trim();
+        }
+        catch (_a) {
+            core.info(`[git-mirror] Could not read block device stats before flush: ${statPath}`);
+        }
+        const startTime = Date.now();
+        try {
+            const result = yield exec.getExecOutput('timeout', [
+                String(FLUSH_TIMEOUT_SECS),
+                'sudo',
+                'blockdev',
+                '--flushbufs',
+                devicePath
+            ], { ignoreReturnCode: true });
+            const duration = Date.now() - startTime;
+            if (result.exitCode === TIMEOUT_EXIT_CODE) {
+                core.warning(`[git-mirror] Flush timed out for ${devicePath} after ${FLUSH_TIMEOUT_SECS}s`);
+                return;
+            }
+            if (result.exitCode !== 0) {
+                core.warning(`[git-mirror] Flush failed for ${devicePath} after ${duration}ms: exit code ${result.exitCode}`);
+                return;
+            }
+            let afterStats = '';
+            try {
+                afterStats = fs.readFileSync(statPath, 'utf8').trim();
+            }
+            catch (_b) {
+                core.info(`[git-mirror] Could not read block device stats after flush: ${statPath}`);
+            }
+            core.info(`[git-mirror] guest flush duration: ${duration}ms, device: ${devicePath}, before_stats: ${beforeStats}, after_stats: ${afterStats}`);
+        }
+        catch (error) {
+            const duration = Date.now() - startTime;
+            const msg = error.message || String(error);
+            core.warning(`[git-mirror] Flush failed for ${devicePath} after ${duration}ms: ${msg}`);
+        }
+    });
+}
+/**
+ * Sleep for the given number of milliseconds.
+ */
+function delay(ms) {
+    return __awaiter(this, void 0, void 0, function* () {
+        yield new Promise(resolve => setTimeout(resolve, ms));
+    });
+}
+/**
+ * Blacksmith VM agent (native "git_mirror" mode): GetStickyDisk returns a raw
+ * block device the privileged runner formats, mounts, unmounts and flushes
+ * itself. Reached at the fixed VM-agent address 192.168.127.1.
+ */
+class BlacksmithBackend {
+    constructor() {
+        this.name = 'blacksmith';
+        this.host = '192.168.127.1';
+        this.stickyDiskType = 'git_mirror';
+    }
+    provisionMount(resp, mountTarget, signal) {
+        return __awaiter(this, void 0, void 0, function* () {
+            const device = resp.diskIdentifier;
+            // Format if needed — checks signal before mkfs.ext4
+            yield maybeFormatDevice(device, signal);
+            signal === null || signal === void 0 ? void 0 : signal.throwIfAborted();
+            // Mount the device at a unique path for this repository
+            yield exec.exec('sudo', ['mkdir', '-p', mountTarget]);
+            yield exec.exec('sudo', ['mount', device, mountTarget]);
+            core.info(`[git-mirror] Mounted ${device} at ${mountTarget}`);
+            return mountTarget;
+        });
+    }
+    prepareMirrorDir(mirrorDir) {
+        return __awaiter(this, void 0, void 0, function* () {
+            var _a, _b, _c, _d;
+            yield exec.exec('sudo', ['mkdir', '-p', mirrorDir]);
+            // Change ownership so git can write to it
+            const uid = (_b = (_a = process.getuid) === null || _a === void 0 ? void 0 : _a.call(process)) !== null && _b !== void 0 ? _b : 1000;
+            const gid = (_d = (_c = process.getgid) === null || _c === void 0 ? void 0 : _c.call(process)) !== null && _d !== void 0 ? _d : 1000;
+            yield exec.exec('sudo', ['chown', '-R', `${uid}:${gid}`, mirrorDir]);
+        });
+    }
+    releaseMount(mountPoint) {
+        return __awaiter(this, void 0, void 0, function* () {
+            // Get device path before unmount for durability flush
+            let devicePath = null;
+            try {
+                devicePath = yield getDeviceFromMount(mountPoint);
+                if (devicePath) {
+                    core.info(`[git-mirror] Found device ${devicePath} for mount point ${mountPoint}`);
+                }
+            }
+            catch (_a) {
+                core.info(`[git-mirror] Could not determine device for ${mountPoint}`);
+            }
+            // Unmount the sticky disk with retry and backoff
+            let unmountSuccess = false;
+            let delayMs = UMOUNT_INITIAL_DELAY_MS;
+            for (let attempt = 1; attempt <= UMOUNT_MAX_RETRIES; attempt++) {
+                core.info(`[git-mirror] Unmounting ${mountPoint} (attempt ${attempt}/${UMOUNT_MAX_RETRIES})`);
+                try {
+                    const umountResult = yield exec.getExecOutput('timeout', [String(UMOUNT_TIMEOUT_SECS), 'sudo', 'umount', mountPoint], { ignoreReturnCode: true });
+                    if (umountResult.exitCode === 0) {
+                        unmountSuccess = true;
+                        core.info(`[git-mirror] Successfully unmounted ${mountPoint}`);
+                        break;
+                    }
+                    if (umountResult.exitCode === TIMEOUT_EXIT_CODE) {
+                        core.warning(`[git-mirror] Unmount attempt ${attempt} timed out after ${UMOUNT_TIMEOUT_SECS}s`);
+                    }
+                    else {
+                        core.warning(`[git-mirror] Unmount attempt ${attempt} failed with exit code ${umountResult.exitCode}`);
+                    }
+                    // Print diagnostic info about what's using the mount point (with 5s timeout to avoid hanging)
+                    core.info(`[git-mirror] Checking for processes using ${mountPoint}...`);
+                    try {
+                        const lsofResult = yield exec.getExecOutput('timeout', ['5', 'lsof', '+D', mountPoint], { ignoreReturnCode: true, silent: true });
+                        if (lsofResult.exitCode === TIMEOUT_EXIT_CODE) {
+                            core.info(`[git-mirror] lsof timed out after 5s`);
+                        }
+                        else if (lsofResult.stdout.trim()) {
+                            core.warning(`[git-mirror] Processes using ${mountPoint}:\n${lsofResult.stdout}`);
+                        }
+                        else {
+                            core.info(`[git-mirror] No processes found using ${mountPoint}`);
+                        }
+                    }
+                    catch (_b) {
+                        // lsof may not be available, try fuser as fallback
+                        try {
+                            const fuserResult = yield exec.getExecOutput('timeout', ['5', 'fuser', '-vm', mountPoint], { ignoreReturnCode: true, silent: true });
+                            if (fuserResult.exitCode === TIMEOUT_EXIT_CODE) {
+                                core.info(`[git-mirror] fuser timed out after 5s`);
+                            }
+                            else if (fuserResult.stdout.trim() || fuserResult.stderr.trim()) {
+                                core.warning(`[git-mirror] Processes using ${mountPoint}:\n${fuserResult.stdout}${fuserResult.stderr}`);
+                            }
+                        }
+                        catch (_c) {
+                            core.info(`[git-mirror] Could not determine processes using ${mountPoint}`);
+                        }
+                    }
+                    if (attempt < UMOUNT_MAX_RETRIES) {
+                        core.info(`[git-mirror] Waiting ${delayMs}ms before retry...`);
+                        yield delay(delayMs);
+                        delayMs *= UMOUNT_BACKOFF_MULTIPLIER;
+                    }
+                }
+                catch (error) {
+                    core.warning(`[git-mirror] Unmount attempt ${attempt} threw error: ${error.message}`);
+                    if (attempt < UMOUNT_MAX_RETRIES) {
+                        core.info(`[git-mirror] Waiting ${delayMs}ms before retry...`);
+                        yield delay(delayMs);
+                        delayMs *= UMOUNT_BACKOFF_MULTIPLIER;
+                    }
+                }
+            }
+            if (!unmountSuccess) {
+                core.warning(`[git-mirror] Failed to unmount ${mountPoint} after ${UMOUNT_MAX_RETRIES} attempts, will not commit sticky disk`);
+            }
+            // Flush block device buffers after unmount to ensure data durability
+            // before the Ceph RBD snapshot is taken. The device is still mapped even
+            // though unmounted.
+            if (devicePath) {
+                yield flushBlockDevice(devicePath);
+            }
+            else {
+                core.info('[git-mirror] Skipping durability flush: device path not found for mount point');
+            }
+            return { released: unmountSuccess };
+        });
+    }
+}
+exports.BlacksmithBackend = BlacksmithBackend;
+
+
+/***/ }),
+
+/***/ 4689:
+/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
+
+"use strict";
+
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || function (mod) {
+    if (mod && mod.__esModule) return mod;
+    var result = {};
+    if (mod != null) for (var k in mod) if (k !== "default" && Object.prototype.hasOwnProperty.call(mod, k)) __createBinding(result, mod, k);
+    __setModuleDefault(result, mod);
+    return result;
+};
+var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, generator) {
+    function adopt(value) { return value instanceof P ? value : new P(function (resolve) { resolve(value); }); }
+    return new (P || (P = Promise))(function (resolve, reject) {
+        function fulfilled(value) { try { step(generator.next(value)); } catch (e) { reject(e); } }
+        function rejected(value) { try { step(generator["throw"](value)); } catch (e) { reject(e); } }
+        function step(result) { result.done ? resolve(result.value) : adopt(result.value).then(fulfilled, rejected); }
+        step((generator = generator.apply(thisArg, _arguments || [])).next());
+    });
+};
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.RoostBackend = void 0;
+const core = __importStar(__nccwpck_require__(2186));
+const fs = __importStar(__nccwpck_require__(7147));
+/**
+ * Self-hosted roost agent (broker/"mount" mode): the agent formats and mounts
+ * the disk and returns a host path, because the ARC runner container is
+ * unprivileged. Reached via STICKY_DISK_GRPC_HOST (the node IP).
+ */
+class RoostBackend {
+    constructor() {
+        this.name = 'roost';
+        this.stickyDiskType = 'mount';
+    }
+    get host() {
+        return process.env.STICKY_DISK_GRPC_HOST || '';
+    }
+    provisionMount(resp, _mountTarget, signal) {
+        return __awaiter(this, void 0, void 0, function* () {
+            signal === null || signal === void 0 ? void 0 : signal.throwIfAborted();
+            const exposePath = resp.diskIdentifier;
+            if (!exposePath.startsWith('/') || !fs.existsSync(exposePath)) {
+                throw new Error(`roost expose path not visible in pod: ${exposePath}`);
+            }
+            core.info(`[git-mirror] roost broker mount at ${exposePath}`);
+            return exposePath;
+        });
+    }
+    prepareMirrorDir(mirrorDir) {
+        return __awaiter(this, void 0, void 0, function* () {
+            // Expose root is world-writable and the container has no sudo.
+            yield fs.promises.mkdir(mirrorDir, { recursive: true });
+        });
+    }
+    releaseMount(mountPoint) {
+        return __awaiter(this, void 0, void 0, function* () {
+            // Agent unmounts/flushes/snapshots during the commit RPC.
+            core.info(`[git-mirror] roost broker mount ${mountPoint}: agent unmounts and flushes during commit`);
+            return { released: true };
+        });
+    }
+}
+exports.RoostBackend = RoostBackend;
 
 
 /***/ }),
