@@ -9,7 +9,22 @@ jest.mock('@connectrpc/connect-node', () => ({
   createGrpcTransport: jest.fn()
 }))
 
+// Avoid the real `sync` exec in cleanup and let the backend be swapped out.
+jest.mock('@actions/exec')
+jest.mock('../src/stickydisk/backend', () => ({
+  selectBackend: jest.fn()
+}))
+
+import {createClient} from '@connectrpc/connect'
+import {selectBackend} from '../src/stickydisk/backend'
 import * as blacksmithCache from '../src/blacksmith-cache'
+
+const mockCreateClient = createClient as jest.MockedFunction<
+  typeof createClient
+>
+const mockSelectBackend = selectBackend as jest.MockedFunction<
+  typeof selectBackend
+>
 
 describe('blacksmith-cache tests', () => {
   describe('getMountPoint', () => {
@@ -240,6 +255,90 @@ describe('blacksmith-cache tests', () => {
       // Mirror paths should not overlap
       expect(mirrorPath1.startsWith(mountPoint2)).toBe(false)
       expect(mirrorPath2.startsWith(mountPoint1)).toBe(false)
+    })
+  })
+
+  describe('cleanup mount release', () => {
+    const commitStickyDisk = jest.fn()
+    const releaseMount = jest.fn()
+
+    function fakeBackend(): unknown {
+      return {
+        name: 'blacksmith',
+        host: '192.168.127.1',
+        stickyDiskType: 'git_mirror',
+        provisionMount: jest.fn(),
+        prepareMirrorDir: jest.fn(),
+        releaseMount
+      }
+    }
+
+    beforeEach(() => {
+      mockCreateClient.mockReturnValue({
+        commitStickyDisk,
+        up: jest.fn(),
+        getStickyDisk: jest.fn()
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      } as any)
+      mockSelectBackend.mockReturnValue(fakeBackend() as never)
+    })
+
+    it('still commits with shouldCommit=false and vmHydratedGitMirror=false when releaseMount reports released:false', async () => {
+      releaseMount.mockResolvedValue({released: false})
+
+      await blacksmithCache.cleanup({
+        exposeId: 'expose-1',
+        stickyDiskKey: 'owner-repo',
+        repoName: 'owner/repo',
+        mountPoint: '/blacksmith-git-mirror/owner/repo',
+        shouldCommit: true,
+        vmHydratedGitMirror: true
+      })
+
+      expect(releaseMount).toHaveBeenCalledWith(
+        '/blacksmith-git-mirror/owner/repo'
+      )
+      // The commit RPC is still sent (so the agent releases the expose)...
+      expect(commitStickyDisk).toHaveBeenCalledTimes(1)
+      // ...but with committing suppressed.
+      expect(commitStickyDisk).toHaveBeenCalledWith(
+        expect.objectContaining({
+          shouldCommit: false,
+          vmHydratedGitMirror: false
+        })
+      )
+    })
+
+    it('commits normally when releaseMount reports released:true', async () => {
+      releaseMount.mockResolvedValue({released: true})
+
+      await blacksmithCache.cleanup({
+        exposeId: 'expose-1',
+        stickyDiskKey: 'owner-repo',
+        repoName: 'owner/repo',
+        mountPoint: '/blacksmith-git-mirror/owner/repo',
+        shouldCommit: true,
+        vmHydratedGitMirror: true
+      })
+
+      expect(commitStickyDisk).toHaveBeenCalledWith(
+        expect.objectContaining({
+          shouldCommit: true,
+          vmHydratedGitMirror: true
+        })
+      )
+    })
+
+    it('skips releaseMount when mountPoint is empty but still commits', async () => {
+      await blacksmithCache.cleanup({
+        exposeId: 'expose-1',
+        stickyDiskKey: 'owner-repo',
+        shouldCommit: true,
+        vmHydratedGitMirror: false
+      })
+
+      expect(releaseMount).not.toHaveBeenCalled()
+      expect(commitStickyDisk).toHaveBeenCalledTimes(1)
     })
   })
 })
