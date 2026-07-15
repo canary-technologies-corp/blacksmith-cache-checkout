@@ -4,7 +4,7 @@ import * as fs from 'fs'
 import * as path from 'path'
 import {createClient, ConnectError, Code} from '@connectrpc/connect'
 import {createGrpcTransport} from '@connectrpc/connect-node'
-import {StickyDiskService} from './stickydisk-proto'
+import {StickyDiskService} from './gen/stickydisk/v1/stickydisk_connect'
 import * as retryHelper from './retry-helper'
 
 const GRPC_PORT = process.env.BLACKSMITH_STICKY_DISK_GRPC_PORT || '5557'
