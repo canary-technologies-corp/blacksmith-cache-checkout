@@ -341,4 +341,50 @@ describe('blacksmith-cache tests', () => {
       expect(commitStickyDisk).toHaveBeenCalledTimes(1)
     })
   })
+
+  describe('setupCache expose release on provisioning failure', () => {
+    const commitStickyDisk = jest.fn()
+
+    beforeEach(() => {
+      commitStickyDisk.mockReset()
+      commitStickyDisk.mockResolvedValue({})
+      mockCreateClient.mockReturnValue({
+        up: jest.fn().mockResolvedValue({}),
+        getStickyDisk: jest.fn().mockResolvedValue({
+          exposeId: 'expose-1',
+          diskIdentifier: '/mnt/roost/expose'
+        }),
+        commitStickyDisk
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      } as any)
+      mockSelectBackend.mockReturnValue({
+        name: 'roost',
+        host: 'fd00::1',
+        stickyDiskType: 'mount',
+        provisionMount: jest
+          .fn()
+          .mockRejectedValue(
+            new Error('roost expose path not visible in pod: /mnt/roost/expose')
+          ),
+        prepareMirrorDir: jest.fn(),
+        releaseMount: jest.fn()
+      } as never)
+    })
+
+    it('releases the expose (shouldCommit=false) when provisionMount throws, then rethrows', async () => {
+      await expect(blacksmithCache.setupCache('owner', 'repo')).rejects.toThrow(
+        'roost expose path not visible'
+      )
+
+      // The expose GetStickyDisk allocated must be released, not leaked.
+      expect(commitStickyDisk).toHaveBeenCalledTimes(1)
+      expect(commitStickyDisk).toHaveBeenCalledWith(
+        expect.objectContaining({
+          exposeId: 'expose-1',
+          shouldCommit: false,
+          vmHydratedGitMirror: false
+        })
+      )
+    })
+  })
 })

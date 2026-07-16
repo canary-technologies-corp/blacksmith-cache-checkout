@@ -212,7 +212,33 @@ function setupCache(owner, repo, signal) {
         // path the agent already mounted (ignoring the target). Either way we get
         // the ready mount-point directory back, and the mirror path is derived from
         // it identically for both providers.
-        const mountPoint = yield backend.provisionMount(response, getMountPoint(owner, repo), signal);
+        let mountPoint;
+        try {
+            mountPoint = yield backend.provisionMount(response, getMountPoint(owner, repo), signal);
+        }
+        catch (error) {
+            // GetStickyDisk already allocated an expose. When provisioning fails we
+            // throw and fall back to standard checkout, so the post-step commit never
+            // runs — release the expose now instead of leaking it. Roost retains
+            // exposes for hours and caps open clones per key, so abandoned mounts would
+            // otherwise accumulate until requests hit ResourceExhausted.
+            try {
+                yield client.commitStickyDisk({
+                    exposeId,
+                    stickyDiskKey,
+                    vmId: process.env.BLACKSMITH_VM_ID || '',
+                    shouldCommit: false,
+                    repoName: repoName || process.env.GITHUB_REPO_NAME || '',
+                    stickyDiskToken: process.env.BLACKSMITH_STICKYDISK_TOKEN || '',
+                    vmHydratedGitMirror: false
+                });
+                core.debug('[git-mirror] Released sticky disk expose after provisioning failure');
+            }
+            catch (releaseError) {
+                core.warning(`[git-mirror] Failed to release sticky disk expose after provisioning failure: ${releaseError.message}`);
+            }
+            throw error;
+        }
         return {
             exposeId,
             stickyDiskKey,
