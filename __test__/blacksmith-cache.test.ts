@@ -9,14 +9,22 @@ jest.mock('@connectrpc/connect-node', () => ({
   createGrpcTransport: jest.fn()
 }))
 
-jest.mock(
-  '@buf/blacksmith_vm-agent.connectrpc_es/stickydisk/v1/stickydisk_connect',
-  () => ({
-    StickyDiskService: {}
-  })
-)
+// Avoid the real `sync` exec in cleanup and let the backend be swapped out.
+jest.mock('@actions/exec')
+jest.mock('../src/stickydisk/backend', () => ({
+  selectBackend: jest.fn()
+}))
 
+import {createClient} from '@connectrpc/connect'
+import {selectBackend} from '../src/stickydisk/backend'
 import * as blacksmithCache from '../src/blacksmith-cache'
+
+const mockCreateClient = createClient as jest.MockedFunction<
+  typeof createClient
+>
+const mockSelectBackend = selectBackend as jest.MockedFunction<
+  typeof selectBackend
+>
 
 describe('blacksmith-cache tests', () => {
   describe('getMountPoint', () => {
@@ -132,6 +140,34 @@ describe('blacksmith-cache tests', () => {
     })
   })
 
+  describe('isRoostEnvironment', () => {
+    const originalEnv = process.env
+
+    beforeEach(() => {
+      jest.resetModules()
+      process.env = {...originalEnv}
+    })
+
+    afterAll(() => {
+      process.env = originalEnv
+    })
+
+    it('returns true when STICKY_DISK_GRPC_HOST is set', () => {
+      process.env['STICKY_DISK_GRPC_HOST'] = 'fd33::1'
+      expect(blacksmithCache.isRoostEnvironment()).toBe(true)
+    })
+
+    it('returns false when STICKY_DISK_GRPC_HOST is not set', () => {
+      delete process.env['STICKY_DISK_GRPC_HOST']
+      expect(blacksmithCache.isRoostEnvironment()).toBe(false)
+    })
+
+    it('returns false when STICKY_DISK_GRPC_HOST is empty string', () => {
+      process.env['STICKY_DISK_GRPC_HOST'] = ''
+      expect(blacksmithCache.isRoostEnvironment()).toBe(false)
+    })
+  })
+
   describe('shouldUseBlacksmithCache', () => {
     const originalEnv = process.env
 
@@ -152,6 +188,21 @@ describe('blacksmith-cache tests', () => {
 
     it('returns false outside of a Blacksmith env regardless of kill switch', () => {
       delete process.env['BLACKSMITH_VM_ID']
+      delete process.env['STICKY_DISK_GRPC_HOST']
+      process.env['BLACKSMITH_BYPASS_CHECKOUT'] = 'true'
+      expect(blacksmithCache.shouldUseBlacksmithCache()).toBe(false)
+    })
+
+    it('returns true in a roost env (STICKY_DISK_GRPC_HOST) without BLACKSMITH_VM_ID', () => {
+      delete process.env['BLACKSMITH_VM_ID']
+      process.env['STICKY_DISK_GRPC_HOST'] = 'fd33::1'
+      delete process.env['BLACKSMITH_BYPASS_CHECKOUT']
+      expect(blacksmithCache.shouldUseBlacksmithCache()).toBe(true)
+    })
+
+    it('honors the kill switch in a roost env', () => {
+      delete process.env['BLACKSMITH_VM_ID']
+      process.env['STICKY_DISK_GRPC_HOST'] = 'fd33::1'
       process.env['BLACKSMITH_BYPASS_CHECKOUT'] = 'true'
       expect(blacksmithCache.shouldUseBlacksmithCache()).toBe(false)
     })
@@ -204,6 +255,139 @@ describe('blacksmith-cache tests', () => {
       // Mirror paths should not overlap
       expect(mirrorPath1.startsWith(mountPoint2)).toBe(false)
       expect(mirrorPath2.startsWith(mountPoint1)).toBe(false)
+    })
+  })
+
+  describe('cleanup mount release', () => {
+    const commitStickyDisk = jest.fn()
+    const releaseMount = jest.fn()
+
+    function fakeBackend(): unknown {
+      return {
+        name: 'blacksmith',
+        host: '192.168.127.1',
+        stickyDiskType: 'git_mirror',
+        provisionMount: jest.fn(),
+        prepareMirrorDir: jest.fn(),
+        releaseMount
+      }
+    }
+
+    beforeEach(() => {
+      mockCreateClient.mockReturnValue({
+        commitStickyDisk,
+        up: jest.fn(),
+        getStickyDisk: jest.fn()
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      } as any)
+      mockSelectBackend.mockReturnValue(fakeBackend() as never)
+    })
+
+    it('still commits with shouldCommit=false and vmHydratedGitMirror=false when releaseMount reports released:false', async () => {
+      releaseMount.mockResolvedValue({released: false})
+
+      await blacksmithCache.cleanup({
+        exposeId: 'expose-1',
+        stickyDiskKey: 'owner-repo',
+        repoName: 'owner/repo',
+        mountPoint: '/blacksmith-git-mirror/owner/repo',
+        shouldCommit: true,
+        vmHydratedGitMirror: true
+      })
+
+      expect(releaseMount).toHaveBeenCalledWith(
+        '/blacksmith-git-mirror/owner/repo'
+      )
+      // The commit RPC is still sent (so the agent releases the expose)...
+      expect(commitStickyDisk).toHaveBeenCalledTimes(1)
+      // ...but with committing suppressed.
+      expect(commitStickyDisk).toHaveBeenCalledWith(
+        expect.objectContaining({
+          shouldCommit: false,
+          vmHydratedGitMirror: false
+        })
+      )
+    })
+
+    it('commits normally when releaseMount reports released:true', async () => {
+      releaseMount.mockResolvedValue({released: true})
+
+      await blacksmithCache.cleanup({
+        exposeId: 'expose-1',
+        stickyDiskKey: 'owner-repo',
+        repoName: 'owner/repo',
+        mountPoint: '/blacksmith-git-mirror/owner/repo',
+        shouldCommit: true,
+        vmHydratedGitMirror: true
+      })
+
+      expect(commitStickyDisk).toHaveBeenCalledWith(
+        expect.objectContaining({
+          shouldCommit: true,
+          vmHydratedGitMirror: true
+        })
+      )
+    })
+
+    it('skips releaseMount when mountPoint is empty but still commits', async () => {
+      await blacksmithCache.cleanup({
+        exposeId: 'expose-1',
+        stickyDiskKey: 'owner-repo',
+        shouldCommit: true,
+        vmHydratedGitMirror: false
+      })
+
+      expect(releaseMount).not.toHaveBeenCalled()
+      expect(commitStickyDisk).toHaveBeenCalledTimes(1)
+    })
+  })
+
+  describe('setupCache expose release on provisioning failure', () => {
+    const commitStickyDisk = jest.fn()
+
+    beforeEach(() => {
+      commitStickyDisk.mockReset()
+      commitStickyDisk.mockResolvedValue({})
+      mockCreateClient.mockReturnValue({
+        up: jest.fn().mockResolvedValue({}),
+        getStickyDisk: jest.fn().mockResolvedValue({
+          exposeId: 'expose-1',
+          diskIdentifier: '/mnt/roost/expose'
+        }),
+        commitStickyDisk
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      } as any)
+      mockSelectBackend.mockReturnValue({
+        name: 'roost',
+        host: 'fd00::1',
+        stickyDiskType: 'mount',
+        provisionMount: jest
+          .fn()
+          .mockRejectedValue(
+            new Error('roost expose path not visible in pod: /mnt/roost/expose')
+          ),
+        prepareMirrorDir: jest.fn(),
+        releaseMount: jest.fn()
+      } as never)
+    })
+
+    it('releases the expose (shouldCommit=false) when provisionMount throws, then rethrows', async () => {
+      await expect(blacksmithCache.setupCache('owner', 'repo')).rejects.toThrow(
+        'roost expose path not visible'
+      )
+
+      // The expose GetStickyDisk allocated must be released, not leaked...
+      expect(commitStickyDisk).toHaveBeenCalledTimes(1)
+      expect(commitStickyDisk).toHaveBeenCalledWith(
+        expect.objectContaining({
+          exposeId: 'expose-1',
+          shouldCommit: false,
+          vmHydratedGitMirror: false
+        }),
+        // ...under an independent short timeout (no signal) so a hung agent
+        // cannot block the fallback to standard checkout.
+        expect.objectContaining({timeoutMs: expect.any(Number)})
+      )
     })
   })
 })

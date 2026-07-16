@@ -4,7 +4,8 @@ import * as fs from 'fs'
 import * as path from 'path'
 import {createClient, ConnectError, Code} from '@connectrpc/connect'
 import {createGrpcTransport} from '@connectrpc/connect-node'
-import {StickyDiskService} from '@buf/blacksmith_vm-agent.connectrpc_es/stickydisk/v1/stickydisk_connect'
+import {StickyDiskService} from './gen/stickydisk/v1/stickydisk_connect'
+import {selectBackend} from './stickydisk/backend'
 import * as retryHelper from './retry-helper'
 
 const GRPC_PORT = process.env.BLACKSMITH_STICKY_DISK_GRPC_PORT || '5557'
@@ -13,11 +14,12 @@ const MIRROR_VERSION = 'v1'
 
 const REFRESH_TIMEOUT_SECS = 90 // 90 seconds, single attempt
 const GC_TIMEOUT_SECS = 120 // 2 minutes
-const FLUSH_TIMEOUT_SECS = 10 // 10 seconds for durability flush
-const UMOUNT_TIMEOUT_SECS = 10 // 10 seconds for unmount
-const UMOUNT_MAX_RETRIES = 3 // Number of unmount retry attempts
-const UMOUNT_INITIAL_DELAY_MS = 1000 // Initial delay between retries (1 second)
-const UMOUNT_BACKOFF_MULTIPLIER = 2 // Exponential backoff multiplier
+
+// Best-effort release of an already-allocated expose when provisioning fails.
+// Bounded independently of the setup signal (which may already be aborted, e.g.
+// the setup timeout fired) so a hung or unhealthy agent can't block the
+// fallback to standard checkout.
+const EXPOSE_RELEASE_TIMEOUT_MS = 10_000
 
 // Exit code returned by the `timeout` command when the child is killed.
 const TIMEOUT_EXIT_CODE = 124
@@ -52,7 +54,6 @@ export interface CacheInfo {
   exposeId: string
   stickyDiskKey: string
   repoName: string
-  device: string
   mountPoint: string
   mirrorPath: string
   // hydrationInProgress indicates that another job is currently hydrating the git mirror.
@@ -72,6 +73,18 @@ export function isBlacksmithEnvironment(): boolean {
 }
 
 /**
+ * Check if running against a self-hosted roost agent (SRE-930).
+ * ARC runner pods inject STICKY_DISK_GRPC_HOST (the node IP) and mount the
+ * agent's expose directory; Blacksmith VMs never set this variable.
+ * Roost serves the same stickydisk gRPC protocol but in broker mode: the
+ * agent formats and mounts the disk itself and returns a path, because the
+ * runner container is unprivileged.
+ */
+export function isRoostEnvironment(): boolean {
+  return !!process.env.STICKY_DISK_GRPC_HOST
+}
+
+/**
  * Control plane short circuit: when an installation has the
  * `bypass_blacksmith_checkout` flag flipped on, the agent exports
  * BLACKSMITH_BYPASS_CHECKOUT=true into the runner environment. We
@@ -80,7 +93,7 @@ export function isBlacksmithEnvironment(): boolean {
  * action then behaves identically to upstream actions/checkout.
  */
 export function shouldUseBlacksmithCache(): boolean {
-  if (!isBlacksmithEnvironment()) {
+  if (!isBlacksmithEnvironment() && !isRoostEnvironment()) {
     return false
   }
   if (process.env.BLACKSMITH_BYPASS_CHECKOUT === 'true') {
@@ -102,54 +115,19 @@ export function getMirrorPath(owner: string, repo: string): string {
 }
 
 /**
- * Create a gRPC client for communicating with the Blacksmith VM agent
+ * Create a gRPC client for communicating with the stickydisk agent at `host`.
+ * The host is bare; a self-hosted roost agent's node IP is IPv6 on ARC
+ * runners, hence the brackets.
  */
-function createBlacksmithClient() {
-  core.debug(`Creating Blacksmith agent client with port: ${GRPC_PORT}`)
+function createBlacksmithClient(host: string) {
+  core.debug(`Creating stickydisk agent client at ${host}:${GRPC_PORT}`)
+  const authority = host.includes(':') ? `[${host}]` : host
   const transport = createGrpcTransport({
-    baseUrl: `http://192.168.127.1:${GRPC_PORT}`,
+    baseUrl: `http://${authority}:${GRPC_PORT}`,
     httpVersion: '2'
   })
 
   return createClient(StickyDiskService, transport)
-}
-
-/**
- * Format the block device with ext4 if not already formatted
- */
-async function maybeFormatDevice(
-  device: string,
-  signal?: AbortSignal
-): Promise<void> {
-  signal?.throwIfAborted()
-
-  const result = await exec.getExecOutput('sudo', ['blkid', device], {
-    ignoreReturnCode: true
-  })
-
-  signal?.throwIfAborted()
-
-  if (result.exitCode === 0 && result.stdout.includes('TYPE=')) {
-    core.debug(`Device ${device} is already formatted`)
-    try {
-      await exec.exec('sudo', ['resize2fs', '-f', device])
-      core.debug(`Resized filesystem on ${device}`)
-    } catch {
-      core.warning(`Error resizing filesystem on ${device}`)
-    }
-    return
-  }
-
-  // Format with ext4
-  core.info(`Formatting device ${device} with ext4`)
-  await exec.exec('sudo', [
-    'mkfs.ext4',
-    '-m0',
-    '-Enodiscard,lazy_itable_init=1,lazy_journal_init=1',
-    '-F',
-    device
-  ])
-  core.debug(`Successfully formatted ${device} with ext4`)
 }
 
 /**
@@ -162,7 +140,8 @@ export async function setupCache(
   repo: string,
   signal?: AbortSignal
 ): Promise<CacheInfo> {
-  const client = createBlacksmithClient()
+  const backend = selectBackend()
+  const client = createBlacksmithClient(backend.host)
   const stickyDiskKey = `${owner}-${repo}`
 
   // Test connection
@@ -171,7 +150,15 @@ export async function setupCache(
     await client.up({}, {signal})
     core.debug('[git-mirror] Successfully connected to Blacksmith agent')
   } catch (error) {
-    throw new Error(`gRPC connection test failed: ${(error as Error).message}`)
+    // roost agents don't implement Up; an UNIMPLEMENTED reply still proves
+    // the server is reachable.
+    if (error instanceof ConnectError && error.code === Code.Unimplemented) {
+      core.debug('[git-mirror] Agent has no Up RPC (roost); continuing')
+    } else {
+      throw new Error(
+        `gRPC connection test failed: ${(error as Error).message}`
+      )
+    }
   }
 
   core.info(`[git-mirror] Requesting sticky disk for ${stickyDiskKey}`)
@@ -182,15 +169,21 @@ export async function setupCache(
   const repoName = `${owner}/${repo}`
   let response
   try {
-    response = await client.getStickyDisk({
-      stickyDiskKey: stickyDiskKey,
-      stickyDiskType: 'git_mirror',
-      region: process.env.BLACKSMITH_REGION || '',
-      installationModelId: process.env.BLACKSMITH_INSTALLATION_MODEL_ID || '',
-      vmId: process.env.BLACKSMITH_VM_ID || '',
-      repoName: repoName,
-      stickyDiskToken: process.env.BLACKSMITH_STICKYDISK_TOKEN || ''
-    }, {signal})
+    response = await client.getStickyDisk(
+      {
+        stickyDiskKey: stickyDiskKey,
+        // Blacksmith VMs use native "git_mirror" (a raw block device); roost
+        // broker mode uses "mount" (the agent formats/mounts and returns a
+        // path, since the runner container cannot mount block devices itself).
+        stickyDiskType: backend.stickyDiskType,
+        region: process.env.BLACKSMITH_REGION || '',
+        installationModelId: process.env.BLACKSMITH_INSTALLATION_MODEL_ID || '',
+        vmId: process.env.BLACKSMITH_VM_ID || '',
+        repoName: repoName,
+        stickyDiskToken: process.env.BLACKSMITH_STICKYDISK_TOKEN || ''
+      },
+      {signal}
+    )
   } catch (error) {
     // Check if this is a gRPC Aborted error indicating hydration in progress
     if (error instanceof ConnectError && error.code === Code.Aborted) {
@@ -206,7 +199,6 @@ export async function setupCache(
         exposeId: '',
         stickyDiskKey,
         repoName,
-        device: '',
         mountPoint: '',
         mirrorPath: '',
         hydrationInProgress: true,
@@ -219,9 +211,10 @@ export async function setupCache(
   }
 
   const exposeId = (response as {exposeId?: string}).exposeId || ''
-  const device = (response as {diskIdentifier?: string}).diskIdentifier || ''
+  const diskIdentifier =
+    (response as {diskIdentifier?: string}).diskIdentifier || ''
 
-  if (!device) {
+  if (!diskIdentifier) {
     throw new Error('No device found in sticky disk response')
   }
 
@@ -230,27 +223,59 @@ export async function setupCache(
   }
 
   core.info(
-    `[git-mirror] Got sticky disk device: ${device}, exposeId: ${exposeId}`
+    `[git-mirror] Got sticky disk identifier: ${diskIdentifier}, exposeId: ${exposeId}`
   )
 
-  // Format if needed — checks signal before mkfs.ext4
-  await maybeFormatDevice(device, signal)
-
-  signal?.throwIfAborted()
-
-  // Mount the device at a unique path for this repository
-  const mountPoint = getMountPoint(owner, repo)
-  await exec.exec('sudo', ['mkdir', '-p', mountPoint])
-  await exec.exec('sudo', ['mount', device, mountPoint])
-  core.info(`[git-mirror] Mounted ${device} at ${mountPoint}`)
+  // Delegate provider-specific provisioning. Blacksmith formats the block
+  // device and mounts it at the computed mount target; roost validates the
+  // path the agent already mounted (ignoring the target). Either way we get
+  // the ready mount-point directory back, and the mirror path is derived from
+  // it identically for both providers.
+  let mountPoint: string
+  try {
+    mountPoint = await backend.provisionMount(
+      response,
+      getMountPoint(owner, repo),
+      signal
+    )
+  } catch (error) {
+    // GetStickyDisk already allocated an expose. When provisioning fails we
+    // throw and fall back to standard checkout, so the post-step commit never
+    // runs — release the expose now instead of leaking it. Roost retains
+    // exposes for hours and caps open clones per key, so abandoned mounts would
+    // otherwise accumulate until requests hit ResourceExhausted.
+    try {
+      // No signal here — the original may already be aborted; bound with our
+      // own short timeout so a hung agent can't block the fallback.
+      await client.commitStickyDisk(
+        {
+          exposeId,
+          stickyDiskKey,
+          vmId: process.env.BLACKSMITH_VM_ID || '',
+          shouldCommit: false,
+          repoName: repoName || process.env.GITHUB_REPO_NAME || '',
+          stickyDiskToken: process.env.BLACKSMITH_STICKYDISK_TOKEN || '',
+          vmHydratedGitMirror: false
+        },
+        {timeoutMs: EXPOSE_RELEASE_TIMEOUT_MS}
+      )
+      core.debug(
+        '[git-mirror] Released sticky disk expose after provisioning failure'
+      )
+    } catch (releaseError) {
+      core.warning(
+        `[git-mirror] Failed to release sticky disk expose after provisioning failure: ${(releaseError as Error).message}`
+      )
+    }
+    throw error
+  }
 
   return {
     exposeId,
     stickyDiskKey,
     repoName,
-    device,
     mountPoint,
-    mirrorPath: getMirrorPath(owner, repo),
+    mirrorPath: path.join(mountPoint, MIRROR_VERSION, `${owner}-${repo}.git`),
     hydrationInProgress: false,
     performedHydration: false // Will be set by ensureMirror if we do initial clone
   }
@@ -338,11 +363,10 @@ export async function ensureMirror(
   const gitEnv = buildGitEnv(verbose)
 
   const mirrorDir = path.dirname(mirrorPath)
-  await exec.exec('sudo', ['mkdir', '-p', mirrorDir])
-  // Change ownership so git can write to it
-  const uid = process.getuid?.() ?? 1000
-  const gid = process.getgid?.() ?? 1000
-  await exec.exec('sudo', ['chown', '-R', `${uid}:${gid}`, mirrorDir])
+  // Blacksmith needs sudo mkdir + chown (privileged runner); roost uses a plain
+  // mkdir as the runner user (world-writable expose, no sudo). The env is
+  // stable across steps so re-selecting here is deterministic.
+  await selectBackend().prepareMirrorDir(mirrorDir)
   await retryHelper.execute(async () => {
     // Clean up any partial clone from a previous failed attempt
     if (fs.existsSync(mirrorPath)) {
@@ -559,122 +583,6 @@ async function runMirrorGC(
   }
 }
 
-/**
- * Get the block device path for a mount point.
- * Tries findmnt first, then falls back to parsing mount output.
- */
-async function getDeviceFromMount(mountPoint: string): Promise<string | null> {
-  try {
-    const result = await exec.getExecOutput(
-      'findmnt',
-      ['-n', '-o', 'SOURCE', mountPoint],
-      {ignoreReturnCode: true, silent: true}
-    )
-    if (result.exitCode === 0 && result.stdout.trim()) {
-      return result.stdout.trim()
-    }
-  } catch {
-    core.info(
-      `[git-mirror] findmnt failed for ${mountPoint}, trying mount command`
-    )
-  }
-
-  try {
-    const result = await exec.getExecOutput('mount', [], {
-      ignoreReturnCode: true,
-      silent: true
-    })
-    if (result.exitCode === 0) {
-      const lines = result.stdout.split('\n')
-      for (const line of lines) {
-        if (line.includes(` ${mountPoint} `)) {
-          const match = line.match(/^(\/dev\/\S+)/)
-          if (match) {
-            return match[1]
-          }
-        }
-      }
-    }
-  } catch {
-    core.info(`[git-mirror] mount command failed for ${mountPoint}`)
-  }
-
-  return null
-}
-
-/**
- * Flush block device buffers to ensure data durability before Ceph RBD snapshot.
- * This is a best-effort operation - failures are logged but don't fail the cleanup.
- */
-async function flushBlockDevice(devicePath: string): Promise<void> {
-  const deviceName = devicePath.replace('/dev/', '')
-  if (!deviceName) {
-    core.info(`[git-mirror] Could not extract device name from ${devicePath}`)
-    return
-  }
-
-  const statPath = `/sys/block/${deviceName}/stat`
-
-  let beforeStats = ''
-  try {
-    beforeStats = fs.readFileSync(statPath, 'utf8').trim()
-  } catch {
-    core.info(
-      `[git-mirror] Could not read block device stats before flush: ${statPath}`
-    )
-  }
-
-  const startTime = Date.now()
-  try {
-    const result = await exec.getExecOutput(
-      'timeout',
-      [
-        String(FLUSH_TIMEOUT_SECS),
-        'sudo',
-        'blockdev',
-        '--flushbufs',
-        devicePath
-      ],
-      {ignoreReturnCode: true}
-    )
-
-    const duration = Date.now() - startTime
-
-    if (result.exitCode === TIMEOUT_EXIT_CODE) {
-      core.warning(
-        `[git-mirror] Flush timed out for ${devicePath} after ${FLUSH_TIMEOUT_SECS}s`
-      )
-      return
-    }
-
-    if (result.exitCode !== 0) {
-      core.warning(
-        `[git-mirror] Flush failed for ${devicePath} after ${duration}ms: exit code ${result.exitCode}`
-      )
-      return
-    }
-
-    let afterStats = ''
-    try {
-      afterStats = fs.readFileSync(statPath, 'utf8').trim()
-    } catch {
-      core.info(
-        `[git-mirror] Could not read block device stats after flush: ${statPath}`
-      )
-    }
-
-    core.info(
-      `[git-mirror] guest flush duration: ${duration}ms, device: ${devicePath}, before_stats: ${beforeStats}, after_stats: ${afterStats}`
-    )
-  } catch (error) {
-    const duration = Date.now() - startTime
-    const msg = (error as Error).message || String(error)
-    core.warning(
-      `[git-mirror] Flush failed for ${devicePath} after ${duration}ms: ${msg}`
-    )
-  }
-}
-
 export interface CleanupOptions {
   exposeId: string
   stickyDiskKey: string
@@ -695,8 +603,9 @@ export interface CleanupOptions {
 /**
  * Cleanup: run GC, sync, unmount, and commit the sticky disk.
  *
- * Execution order: GC → sync → unmount (with retry) → flush → commit
- * If any of mirror refresh / GC fail or time out, shouldCommit is set to false.
+ * Execution order: GC → sync → release mount (backend) → commit
+ * If any of mirror refresh / GC / mount release fail, shouldCommit is set to
+ * false (but the commit RPC is still sent so the agent releases the expose).
  */
 export async function cleanup(options: CleanupOptions): Promise<CleanupResult> {
   const {
@@ -753,125 +662,23 @@ export async function cleanup(options: CleanupOptions): Promise<CleanupResult> {
     core.warning('[git-mirror] Failed to sync filesystem')
   }
 
-  // Get device path before unmount for durability flush
-  let devicePath: string | null = null
+  // Release the mount before committing. cleanup runs in a separate process
+  // from setup, so we re-select the backend from the (stable) environment.
+  // Blacksmith unmounts (with retries) and flushes the block device, reporting
+  // released=false if the unmount ultimately failed; roost is a no-op (its
+  // agent unmounts, flushes, and snapshots the disk itself during the commit
+  // RPC below). Guard on a non-empty mountPoint (the hydration-fallback path
+  // saves none).
+  const backend = selectBackend()
   if (mountPoint) {
-    try {
-      devicePath = await getDeviceFromMount(mountPoint)
-      if (devicePath) {
-        core.info(
-          `[git-mirror] Found device ${devicePath} for mount point ${mountPoint}`
-        )
-      }
-    } catch {
-      core.info(`[git-mirror] Could not determine device for ${mountPoint}`)
-    }
-  }
-
-  // Unmount the sticky disk with retry and backoff
-  if (mountPoint) {
-    let unmountSuccess = false
-    let delayMs = UMOUNT_INITIAL_DELAY_MS
-
-    for (let attempt = 1; attempt <= UMOUNT_MAX_RETRIES; attempt++) {
-      core.info(
-        `[git-mirror] Unmounting ${mountPoint} (attempt ${attempt}/${UMOUNT_MAX_RETRIES})`
-      )
-      try {
-        const umountResult = await exec.getExecOutput(
-          'timeout',
-          [String(UMOUNT_TIMEOUT_SECS), 'sudo', 'umount', mountPoint],
-          {ignoreReturnCode: true}
-        )
-        if (umountResult.exitCode === 0) {
-          unmountSuccess = true
-          core.info(`[git-mirror] Successfully unmounted ${mountPoint}`)
-          break
-        }
-
-        if (umountResult.exitCode === TIMEOUT_EXIT_CODE) {
-          core.warning(
-            `[git-mirror] Unmount attempt ${attempt} timed out after ${UMOUNT_TIMEOUT_SECS}s`
-          )
-        } else {
-          core.warning(
-            `[git-mirror] Unmount attempt ${attempt} failed with exit code ${umountResult.exitCode}`
-          )
-        }
-
-        // Print diagnostic info about what's using the mount point (with 5s timeout to avoid hanging)
-        core.info(`[git-mirror] Checking for processes using ${mountPoint}...`)
-        try {
-          const lsofResult = await exec.getExecOutput(
-            'timeout',
-            ['5', 'lsof', '+D', mountPoint],
-            {ignoreReturnCode: true, silent: true}
-          )
-          if (lsofResult.exitCode === TIMEOUT_EXIT_CODE) {
-            core.info(`[git-mirror] lsof timed out after 5s`)
-          } else if (lsofResult.stdout.trim()) {
-            core.warning(
-              `[git-mirror] Processes using ${mountPoint}:\n${lsofResult.stdout}`
-            )
-          } else {
-            core.info(`[git-mirror] No processes found using ${mountPoint}`)
-          }
-        } catch {
-          // lsof may not be available, try fuser as fallback
-          try {
-            const fuserResult = await exec.getExecOutput(
-              'timeout',
-              ['5', 'fuser', '-vm', mountPoint],
-              {ignoreReturnCode: true, silent: true}
-            )
-            if (fuserResult.exitCode === TIMEOUT_EXIT_CODE) {
-              core.info(`[git-mirror] fuser timed out after 5s`)
-            } else if (fuserResult.stdout.trim() || fuserResult.stderr.trim()) {
-              core.warning(
-                `[git-mirror] Processes using ${mountPoint}:\n${fuserResult.stdout}${fuserResult.stderr}`
-              )
-            }
-          } catch {
-            core.info(
-              `[git-mirror] Could not determine processes using ${mountPoint}`
-            )
-          }
-        }
-
-        if (attempt < UMOUNT_MAX_RETRIES) {
-          core.info(`[git-mirror] Waiting ${delayMs}ms before retry...`)
-          await new Promise(resolve => setTimeout(resolve, delayMs))
-          delayMs *= UMOUNT_BACKOFF_MULTIPLIER
-        }
-      } catch (error) {
-        core.warning(
-          `[git-mirror] Unmount attempt ${attempt} threw error: ${(error as Error).message}`
-        )
-        if (attempt < UMOUNT_MAX_RETRIES) {
-          core.info(`[git-mirror] Waiting ${delayMs}ms before retry...`)
-          await new Promise(resolve => setTimeout(resolve, delayMs))
-          delayMs *= UMOUNT_BACKOFF_MULTIPLIER
-        }
-      }
-    }
-
-    if (!unmountSuccess) {
-      core.warning(
-        `[git-mirror] Failed to unmount ${mountPoint} after ${UMOUNT_MAX_RETRIES} attempts, will not commit sticky disk`
-      )
+    const {released} = await backend.releaseMount(mountPoint)
+    if (!released) {
+      // The unmount ultimately failed: don't snapshot a still-mounted, dirty
+      // filesystem. We still send the commit RPC below (with should_commit
+      // false) so the agent releases the expose without persisting bad state.
       shouldCommit = false
       vmHydratedGitMirror = false
     }
-  }
-
-  // Flush block device buffers after unmount to ensure data durability
-  // before the Ceph RBD snapshot is taken. The device is still mapped even though unmounted.
-  if (devicePath) {
-    await flushBlockDevice(devicePath)
-  } else if (mountPoint) {
-    core.info(
-      '[git-mirror] Skipping durability flush: device path not found for mount point'
-    )
   }
 
   // Commit the sticky disk to persist changes
@@ -879,7 +686,7 @@ export async function cleanup(options: CleanupOptions): Promise<CleanupResult> {
     `[git-mirror] Committing sticky disk: shouldCommit=${shouldCommit}, vmHydratedGitMirror=${vmHydratedGitMirror}`
   )
   try {
-    const client = createBlacksmithClient()
+    const client = createBlacksmithClient(backend.host)
 
     await client.commitStickyDisk({
       exposeId: exposeId,

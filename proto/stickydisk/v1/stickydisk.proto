@@ -1,0 +1,58 @@
+syntax = "proto3";
+
+// Blacksmith stickydisk protocol — the subset this action speaks.
+//
+// This schema is the single source of truth for the gRPC client in
+// src/blacksmith-cache.ts. The TypeScript client/message types are produced
+// from it by `buf generate` (see ../../buf.gen.yaml) into src/gen/, so we no
+// longer depend on the BSR-published @buf/blacksmith_vm-agent.* packages
+// (which require a Blacksmith-issued BUF_TOKEN this fork does not have).
+//
+// Message names, field numbers, and types are wire-identical to Blacksmith's
+// VM agent — and to the self-hosted roost agent, which reimplements the same
+// protocol. Only the three RPCs this action calls are declared here
+// (GetStickyDisk, CommitStickyDisk, Up); Blacksmith's full StickyDiskService
+// also exposes QueueDockerJob and ReportMetric, which this action never calls.
+// To adopt more of the protocol, add the messages/RPCs here and regenerate.
+
+package stickydisk.v1;
+
+message GetStickyDiskRequest {
+  string sticky_disk_key = 1;
+  string region = 2;
+  string installation_model_id = 3;
+  string vm_id = 4;
+  string sticky_disk_type = 5;
+  string repo_name = 6;
+  string sticky_disk_token = 7;
+}
+
+message GetStickyDiskResponse {
+  string expose_id = 1;
+  string disk_identifier = 2;
+  string parent_snapshot_name = 3;
+  string clone_name = 4;
+}
+
+message CommitStickyDiskRequest {
+  string expose_id = 1;
+  string sticky_disk_key = 2;
+  string vm_id = 3;
+  bool should_commit = 4;
+  string repo_name = 5;
+  string sticky_disk_token = 6;
+  int64 fs_disk_usage_bytes = 7;
+  bool vm_hydrated_git_mirror = 8;
+}
+
+message CommitStickyDiskResponse {}
+
+message UpRequest {}
+
+message UpResponse {}
+
+service StickyDiskService {
+  rpc GetStickyDisk(GetStickyDiskRequest) returns (GetStickyDiskResponse);
+  rpc CommitStickyDisk(CommitStickyDiskRequest) returns (CommitStickyDiskResponse);
+  rpc Up(UpRequest) returns (UpResponse);
+}
