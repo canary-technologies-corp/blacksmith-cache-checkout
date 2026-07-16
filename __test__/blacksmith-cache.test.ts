@@ -376,14 +376,17 @@ describe('blacksmith-cache tests', () => {
         'roost expose path not visible'
       )
 
-      // The expose GetStickyDisk allocated must be released, not leaked.
+      // The expose GetStickyDisk allocated must be released, not leaked...
       expect(commitStickyDisk).toHaveBeenCalledTimes(1)
       expect(commitStickyDisk).toHaveBeenCalledWith(
         expect.objectContaining({
           exposeId: 'expose-1',
           shouldCommit: false,
           vmHydratedGitMirror: false
-        })
+        }),
+        // ...under an independent short timeout (no signal) so a hung agent
+        // cannot block the fallback to standard checkout.
+        expect.objectContaining({timeoutMs: expect.any(Number)})
       )
     })
   })

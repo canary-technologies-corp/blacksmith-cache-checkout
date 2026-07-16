@@ -15,6 +15,12 @@ const MIRROR_VERSION = 'v1'
 const REFRESH_TIMEOUT_SECS = 90 // 90 seconds, single attempt
 const GC_TIMEOUT_SECS = 120 // 2 minutes
 
+// Best-effort release of an already-allocated expose when provisioning fails.
+// Bounded independently of the setup signal (which may already be aborted, e.g.
+// the setup timeout fired) so a hung or unhealthy agent can't block the
+// fallback to standard checkout.
+const EXPOSE_RELEASE_TIMEOUT_MS = 10_000
+
 // Exit code returned by the `timeout` command when the child is killed.
 const TIMEOUT_EXIT_CODE = 124
 
@@ -239,15 +245,20 @@ export async function setupCache(
     // exposes for hours and caps open clones per key, so abandoned mounts would
     // otherwise accumulate until requests hit ResourceExhausted.
     try {
-      await client.commitStickyDisk({
-        exposeId,
-        stickyDiskKey,
-        vmId: process.env.BLACKSMITH_VM_ID || '',
-        shouldCommit: false,
-        repoName: repoName || process.env.GITHUB_REPO_NAME || '',
-        stickyDiskToken: process.env.BLACKSMITH_STICKYDISK_TOKEN || '',
-        vmHydratedGitMirror: false
-      })
+      // No signal here — the original may already be aborted; bound with our
+      // own short timeout so a hung agent can't block the fallback.
+      await client.commitStickyDisk(
+        {
+          exposeId,
+          stickyDiskKey,
+          vmId: process.env.BLACKSMITH_VM_ID || '',
+          shouldCommit: false,
+          repoName: repoName || process.env.GITHUB_REPO_NAME || '',
+          stickyDiskToken: process.env.BLACKSMITH_STICKYDISK_TOKEN || '',
+          vmHydratedGitMirror: false
+        },
+        {timeoutMs: EXPOSE_RELEASE_TIMEOUT_MS}
+      )
       core.debug(
         '[git-mirror] Released sticky disk expose after provisioning failure'
       )
