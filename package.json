@@ -9,6 +9,7 @@
     "format": "prettier --write '**/*.ts'",
     "format-check": "prettier --check '**/*.ts'",
     "lint": "eslint src/**/*.ts",
+    "pretest": "buf generate",
     "test": "jest",
     "licensed-check": "src/misc/licensed-check.sh",
     "licensed-generate": "src/misc/licensed-generate.sh"
